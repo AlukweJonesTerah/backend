@@ -9,8 +9,18 @@ from typing import Optional
 from pydub import AudioSegment
 from datetime import datetime
 import json
-import psutil
 import resource
+import resource
+
+def check_memory_usage():
+    """Simple memory check without psutil"""
+    try:
+        import psutil
+        memory = psutil.virtual_memory()
+        return memory.percent
+    except ImportError:
+        # Fallback if psutil not available
+        return 0
 
 # Set seed for consistent language detection
 DetectorFactory.seed = 0
