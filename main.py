@@ -10,17 +10,6 @@ from pydub import AudioSegment
 from datetime import datetime
 import json
 import resource
-import resource
-
-def check_memory_usage():
-    """Simple memory check without psutil"""
-    try:
-        import psutil
-        memory = psutil.virtual_memory()
-        return memory.percent
-    except ImportError:
-        # Fallback if psutil not available
-        return 0
 
 # Set seed for consistent language detection
 DetectorFactory.seed = 0
@@ -34,6 +23,14 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# Try to import psutil for memory monitoring, but provide fallback
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+    logger.warning("psutil not available, memory monitoring limited")
 
 # Railway-specific optimizations
 if os.getenv("RAILWAY_ENVIRONMENT"):
@@ -66,9 +63,34 @@ def is_port_in_use(port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         return s.connect_ex(('localhost', port)) == 0
 
+def check_memory_usage():
+    """Check current memory usage with fallback if psutil not available"""
+    if PSUTIL_AVAILABLE:
+        try:
+            memory = psutil.virtual_memory()
+            return memory.percent
+        except Exception as e:
+            logger.warning(f"Memory check failed: {e}")
+    
+    # Fallback: check using resource module (Unix only)
+    try:
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        # This gives memory in KB, convert to percentage is tricky without total
+        memory_mb = usage.ru_maxrss / 1024  # Convert to MB
+        # Rough estimate: assume 512MB total on Railway
+        estimated_percent = (memory_mb / 512) * 100
+        return min(estimated_percent, 100)
+    except:
+        return 0
+
 # Pydantic models
 class ChatbotRequest(BaseModel):
     message: str
+    session_id: Optional[str] = None
+
+class FeedbackRequest(BaseModel):
+    original_transcript: str
+    corrected_text: str
     session_id: Optional[str] = None
 
 app = FastAPI(
@@ -101,19 +123,26 @@ def initialize_google_clients():
         # Method 1: Base64 encoded credentials (Recommended for Railway)
         creds_base64 = os.getenv("GOOGLE_CREDENTIALS_BASE64")
         if creds_base64:
-            import base64
-            from google.oauth2 import service_account
-            
             creds_json = base64.b64decode(creds_base64).decode('utf-8')
-            credentials = service_account.Credentials.from_service_account_info(
-                json.loads(creds_json)
-            )
+            credentials_dict = json.loads(creds_json)
+            
+            from google.oauth2 import service_account
+            credentials = service_account.Credentials.from_service_account_info(credentials_dict)
+            
             speech_client = speech.SpeechClient(credentials=credentials)
             tts_client = texttospeech.TextToSpeechClient(credentials=credentials)
             logger.info("✅ Google Cloud clients initialized from environment variable")
             return
         
-        # Method 2: For local development
+        # Method 2: JSON file path
+        creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+        if creds_path and os.path.exists(creds_path):
+            speech_client = speech.SpeechClient.from_service_account_file(creds_path)
+            tts_client = texttospeech.TextToSpeechClient.from_service_account_file(creds_path)
+            logger.info("✅ Google Cloud clients initialized from file path")
+            return
+            
+        # Method 3: Default local file for development
         default_path = "./google-credentials.json"
         if os.path.exists(default_path):
             speech_client = speech.SpeechClient.from_service_account_file(default_path)
@@ -125,14 +154,6 @@ def initialize_google_clients():
         
     except Exception as e:
         logger.error(f"❌ Failed to initialize Google Cloud clients: {e}")
-
-def check_memory_usage():
-    """Check current memory usage"""
-    try:
-        memory = psutil.virtual_memory()
-        return memory.percent
-    except:
-        return 0
 
 def reduce_audio_quality(audio_content: bytes) -> bytes:
     """Reduce audio quality to save memory on Railway"""
@@ -146,7 +167,6 @@ def reduce_audio_quality(audio_content: bytes) -> bytes:
         # Aggressive downsampling for memory conservation
         audio = audio.set_frame_rate(8000)  # Lower sample rate
         audio = audio.set_channels(1)       # Mono only
-        audio = audio.low_pass_filter(4000) # Reduce high frequencies
         
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_out:
             audio.export(temp_out.name, format="wav", 
@@ -197,10 +217,13 @@ def enhanced_language_detection(text: str) -> str:
         
         # Boost confidence for agricultural terms
         agricultural_terms = {
-            'en': ['farm', 'crop', 'irrigation', 'harvest', 'soil', 'weather'],
-            'sw': ['shamba', 'mazao', 'umwagiliaji', 'mvua', 'udongo'],
-            'fr': ['ferme', 'culture', 'irrigation', 'récolte', 'sol'],
-            'es': ['granja', 'cultivo', 'riego', 'cosecha', 'suelo']
+            'en': ['farm', 'crop', 'irrigation', 'harvest', 'soil', 'weather', 'agriculture'],
+            'sw': ['shamba', 'mazao', 'umwagiliaji', 'mvua', 'udongo', 'kilimo'],
+            'fr': ['ferme', 'culture', 'irrigation', 'récolte', 'sol', 'agriculture'],
+            'es': ['granja', 'cultivo', 'riego', 'cosecha', 'suelo', 'agricultura'],
+            'pt': ['fazenda', 'cultivo', 'irrigação', 'colheita', 'solo', 'agricultura'],
+            'ar': ['مزرعة', 'محصول', 'ري', 'حصاد', 'تربة', 'زراعة'],
+            'hi': ['खेत', 'फसल', 'सिंचाई', 'फसल कटाई', 'मिट्टी', 'कृषि']
         }
         
         text_lower = text.lower()
@@ -235,7 +258,8 @@ def enhanced_language_detection(text: str) -> str:
                 if keyword in text_lower:
                     scores[lang] += 1
         
-        return max(scores.items(), key=lambda x: x[1])[0]
+        best_lang = max(scores.items(), key=lambda x: x[1])[0]
+        return best_lang if scores[best_lang] > 0 else 'en'
 
 def convert_audio_format(audio_content: bytes, target_format: str = "wav") -> bytes:
     """Convert audio to compatible format for Google Speech-to-Text"""
@@ -451,19 +475,6 @@ async def process_audio_to_text(audio_content: bytes, content_type: str = "audio
         logger.error(f"Speech recognition error: {e}")
         raise HTTPException(status_code=400, detail="Shida katika kusikiliza sauti. Tafadhali jaribu tena baadae.")
 
-def extract_audio_metadata(audio_path: str) -> dict:
-    """Extract audio metadata such as sample rate and channel count."""
-    try:
-        from pydub.utils import mediainfo
-        info = mediainfo(audio_path)
-        return {
-            "sample_rate_hertz": int(info.get("sample_rate", 48000)),
-            "audio_channel_count": int(info.get("channels", 2)),
-        }
-    except Exception as e:
-        logger.error(f"Failed to extract audio metadata: {e}")
-        return {"sample_rate_hertz": 48000, "audio_channel_count": 2}
-    
 async def call_php_chatbot(message: str, session_id: Optional[str] = None) -> dict:
     """Call the PHP chatbot backend and return the complete response"""
     try:
@@ -578,7 +589,7 @@ async def process_voice(
 
         # Step 1: Speech to Text
         try:
-            transcript = await process_audio_to_text(audio_content)
+            transcript = await process_audio_to_text(audio_content, audio.content_type)
             if not transcript or len(transcript.strip()) < 2:
                 raise HTTPException(status_code=400, detail="Mazungumzo yamekubalika lakini hayaeleweki. Tafadhali ongea wazi zaidi.")
         except HTTPException:
@@ -667,15 +678,17 @@ async def health_check():
             "status": "healthy",
             "service": "AgriWatt Voice Bot",
             "php_chatbot": php_status,
-            "php_chatbot_url": CHATBOT_URL,  # This will now show your production URL
-            "python_server": "web-production-39e82.up.railway.app"
+            "google_services": "connected" if speech_client and tts_client else "disconnected",
+            "memory_usage": f"{check_memory_usage()}%",
+            "timestamp": datetime.now().isoformat()
         }
     except Exception as e:
         return {
             "status": "degraded",
             "service": "AgriWatt Voice Bot", 
             "php_chatbot": "disconnected",
-            "error": str(e)
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
         }
 
 @app.get("/")
@@ -697,30 +710,27 @@ async def root():
             "health": "/health (GET)",
             "docs": "/docs (GET)"
         },
-        "backend": CHATBOT_URL
+        "backend": CHATBOT_URL,
+        "timestamp": datetime.now().isoformat()
     }
 
 @app.post("/api/voice/feedback")
-async def voice_feedback(
-    original_transcript: str = Form(...),
-    corrected_text: str = Form(...),
-    session_id: Optional[str] = Form(None)
-):
+async def voice_feedback(request_data: FeedbackRequest):
     """Collect user feedback to improve STT accuracy"""
     try:
         # Ensure logs directory exists
         os.makedirs('logs', exist_ok=True)
         
         # Log the correction for analysis
-        logger.info(f"STT Correction - Original: '{original_transcript}' -> Corrected: '{corrected_text}'")
+        logger.info(f"STT Correction - Original: '{request_data.original_transcript}' -> Corrected: '{request_data.corrected_text}'")
         
         feedback_data = {
             'timestamp': datetime.now().isoformat(),
-            'session_id': session_id,
-            'original': original_transcript,
-            'corrected': corrected_text,
-            'difference': len([i for i in range(min(len(original_transcript), len(corrected_text))) 
-                            if original_transcript[i] != corrected_text[i]])
+            'session_id': request_data.session_id,
+            'original': request_data.original_transcript,
+            'corrected': request_data.corrected_text,
+            'difference': len([i for i in range(min(len(request_data.original_transcript), len(request_data.corrected_text))) 
+                            if request_data.original_transcript[i] != request_data.corrected_text[i]])
         }
         
         feedback_file = 'logs/stt_feedback.json'
@@ -737,27 +747,68 @@ async def voice_feedback(
 async def metrics():
     """System metrics endpoint for monitoring"""
     try:
-        memory = psutil.virtual_memory()
-        disk = psutil.disk_usage('/')
-        cpu = psutil.cpu_percent(interval=0.1)
+        memory_usage = check_memory_usage()
         
-        return {
-            "memory": {
-                "total": memory.total,
-                "available": memory.available,
-                "percent": memory.percent,
-                "used": memory.used
-            },
-            "disk": {
-                "total": disk.total,
-                "used": disk.used,
-                "free": disk.free,
-                "percent": disk.percent
-            },
-            "cpu": cpu,
+        metrics_data = {
+            "memory_usage_percent": memory_usage,
             "google_clients": "initialized" if speech_client and tts_client else "not_initialized",
             "timestamp": datetime.now().isoformat()
         }
+        
+        # Add psutil metrics if available
+        if PSUTIL_AVAILABLE:
+            memory = psutil.virtual_memory()
+            disk = psutil.disk_usage('/')
+            cpu = psutil.cpu_percent(interval=0.1)
+            
+            metrics_data.update({
+                "memory": {
+                    "total": memory.total,
+                    "available": memory.available,
+                    "percent": memory.percent,
+                    "used": memory.used
+                },
+                "disk": {
+                    "total": disk.total,
+                    "used": disk.used,
+                    "free": disk.free,
+                    "percent": disk.percent
+                },
+                "cpu": cpu
+            })
+        
+        return metrics_data
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.get("/debug/audio-info")
+async def debug_audio_info(audio: UploadFile = File(...)):
+    """Debug endpoint to get audio file information"""
+    try:
+        audio_content = await audio.read()
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".audio") as temp_file:
+            temp_file.write(audio_content)
+            temp_path = temp_file.name
+        
+        try:
+            audio_segment = AudioSegment.from_file(temp_path)
+            
+            info = {
+                "file_size": len(audio_content),
+                "duration_seconds": len(audio_segment) / 1000.0,
+                "channels": audio_segment.channels,
+                "sample_width": audio_segment.sample_width,
+                "frame_rate": audio_segment.frame_rate,
+                "frame_count": audio_segment.frame_count(),
+                "content_type": audio.content_type
+            }
+            
+            return info
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+                
     except Exception as e:
         return {"error": str(e)}
 
