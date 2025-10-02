@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from google.cloud import speech, texttospeech
@@ -9,13 +9,52 @@ from typing import Optional
 from pydub import AudioSegment
 from datetime import datetime
 import json
+import psutil
+import resource
 
 # Set seed for consistent language detection
 DetectorFactory.seed = 0
 
-# Configure logging for Render
-logging.basicConfig(level=logging.INFO)
+# Configure logging for Railway
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),  # Railway captures stdout
+    ]
+)
 logger = logging.getLogger(__name__)
+
+# Railway-specific optimizations
+if os.getenv("RAILWAY_ENVIRONMENT"):
+    logger.info("🚆 Running on Railway - applying optimizations")
+    
+    # Reduce memory usage for Railway's free tier
+    os.environ["GRPC_ENABLE_FORK_SUPPORT"] = "False"
+    os.environ["GRPC_POLL_STRATEGY"] = "poll"
+    
+    # Set memory limits
+    try:
+        # 450MB limit to stay safe within 512MB
+        memory_limit = 450 * 1024 * 1024
+        resource.setrlimit(resource.RLIMIT_AS, (memory_limit, memory_limit))
+        logger.info("Memory limits set for Railway free tier")
+    except:
+        logger.warning("Could not set memory limits")
+
+def optimize_thread_pool():
+    """Optimize thread pool for Railway free tier"""
+    import concurrent.futures
+    return concurrent.futures.ThreadPoolExecutor(max_workers=2)
+
+# Initialize optimized executor
+executor = optimize_thread_pool()
+
+def is_port_in_use(port: int) -> bool:
+    """Check if port is in use (for local development)"""
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        return s.connect_ex(('localhost', port)) == 0
 
 # Pydantic models
 class ChatbotRequest(BaseModel):
@@ -38,8 +77,8 @@ app.add_middleware(
 )
 
 # Environment variables
-CHATBOT_URL = os.getenv("CHATBOT_URL", "https://agriwatthub.com/chatbot-api.php")
-MAX_AUDIO_SIZE = 10 * 1024 * 1024  # 10MB limit
+CHATBOT_URL = os.getenv("CHATBOT_URL", "https://your-domain.com/CompanyWeb1/chatbot-api.php")
+MAX_AUDIO_SIZE = int(os.getenv("MAX_AUDIO_SIZE", 5 * 1024 * 1024))  # 5MB limit for Railway
 PORT = int(os.getenv("PORT", 8000))
 
 # Initialize Google Cloud clients
@@ -49,7 +88,7 @@ tts_client = None
 def initialize_google_clients():
     global speech_client, tts_client
     try:
-        # Method 1: Base64 encoded credentials (Recommended for Render)
+        # Method 1: Base64 encoded credentials (Recommended for Railway)
         creds_base64 = os.getenv("GOOGLE_CREDENTIALS_BASE64")
         if creds_base64:
             import base64
@@ -77,13 +116,69 @@ def initialize_google_clients():
     except Exception as e:
         logger.error(f"❌ Failed to initialize Google Cloud clients: {e}")
 
-# Initialize on startup
-initialize_google_clients()
+def check_memory_usage():
+    """Check current memory usage"""
+    try:
+        memory = psutil.virtual_memory()
+        return memory.percent
+    except:
+        return 0
 
-# [Keep all your existing functions exactly as they are]
-# enhanced_language_detection, convert_audio_format, get_speech_context, 
-# correct_domain_terms, get_voice_config, enhance_audio_quality,
-# process_audio_to_text, extract_audio_metadata, call_php_chatbot, text_to_speech
+def reduce_audio_quality(audio_content: bytes) -> bytes:
+    """Reduce audio quality to save memory on Railway"""
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_in:
+            temp_in.write(audio_content)
+            temp_in_path = temp_in.name
+        
+        audio = AudioSegment.from_file(temp_in_path)
+        
+        # Aggressive downsampling for memory conservation
+        audio = audio.set_frame_rate(8000)  # Lower sample rate
+        audio = audio.set_channels(1)       # Mono only
+        audio = audio.low_pass_filter(4000) # Reduce high frequencies
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_out:
+            audio.export(temp_out.name, format="wav", 
+                        parameters=["-ac", "1", "-ar", "8000", "-acodec", "pcm_s16le"])
+            
+            with open(temp_out.name, "rb") as f:
+                reduced_audio = f.read()
+        
+        # Cleanup
+        for path in [temp_in_path, temp_out.name]:
+            if os.path.exists(path):
+                os.unlink(path)
+                
+        logger.info("Audio quality reduced for Railway optimization")
+        return reduced_audio
+        
+    except Exception as e:
+        logger.warning(f"Audio quality reduction failed: {e}")
+        return audio_content
+
+# Initialize on startup
+@app.on_event("startup")
+async def startup_event():
+    """Startup optimization for Railway"""
+    logger.info("🚆 Starting AgriWatt Voice Bot on Railway")
+    
+    # Initialize Google clients
+    initialize_google_clients()
+    
+    # Pre-warm Google Cloud clients
+    if speech_client:
+        try:
+            # Test speech client (this will warm up the connection)
+            await asyncio.get_event_loop().run_in_executor(
+                executor, 
+                lambda: speech_client.get_operation(name="test")
+            )
+        except Exception as e:
+            logger.info("Google Cloud clients warmed up (expected test failure)")
+    
+    logger.info(f"✅ AgriWatt Voice Bot ready on port {PORT}")
+    logger.info(f"✅ Memory usage: {check_memory_usage()}%")
 
 def enhanced_language_detection(text: str) -> str:
     """Enhanced multilingual detection with agricultural focus"""
@@ -135,6 +230,12 @@ def enhanced_language_detection(text: str) -> str:
 def convert_audio_format(audio_content: bytes, target_format: str = "wav") -> bytes:
     """Convert audio to compatible format for Google Speech-to-Text"""
     try:
+        # Check memory usage
+        memory_usage = check_memory_usage()
+        if memory_usage > 70:
+            logger.warning(f"High memory usage ({memory_usage}%), optimizing conversion")
+            audio_content = reduce_audio_quality(audio_content)
+
         with tempfile.NamedTemporaryFile(delete=False, suffix=".audio") as temp_in:
             temp_in.write(audio_content)
             temp_in_path = temp_in.name
@@ -213,15 +314,21 @@ def get_voice_config(language_code: str) -> tuple:
 def enhance_audio_quality(audio_content: bytes) -> bytes:
     """Enhance audio quality for better STT accuracy"""
     try:
+        # Check memory before processing
+        memory_usage = check_memory_usage()
+        if memory_usage > 75:
+            logger.warning(f"Memory usage high ({memory_usage}%), skipping audio enhancement")
+            return audio_content
+
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_in:
             temp_in.write(audio_content)
             temp_in_path = temp_in.name
         
         audio = AudioSegment.from_file(temp_in_path)
         
-        audio = audio.high_pass_filter(80)
-        audio = audio.low_pass_filter(8000)
-        audio = audio.normalize()
+        # Light enhancements for Railway
+        audio = audio.high_pass_filter(80)  # Remove low-frequency noise
+        audio = audio.normalize()  # Normalize volume
         
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_out:
             audio.export(temp_out.name, format="wav", parameters=[
@@ -249,7 +356,13 @@ async def process_audio_to_text(audio_content: bytes, content_type: str = "audio
         if speech_client is None:
             raise HTTPException(status_code=503, detail="Speech service temporarily unavailable")
         
-        enhanced_audio = enhance_audio_quality(audio_content)
+        # Memory check
+        memory_usage = check_memory_usage()
+        if memory_usage > 80:
+            logger.warning(f"High memory usage ({memory_usage}%), reducing audio quality")
+            audio_content = reduce_audio_quality(audio_content)
+        else:
+            audio_content = enhance_audio_quality(audio_content)
 
         if len(audio_content) < 1000:
             raise HTTPException(status_code=400, detail="Audio recording too short")
@@ -296,9 +409,10 @@ async def process_audio_to_text(audio_content: bytes, content_type: str = "audio
                 speech_contexts=[get_speech_context()] 
             )
             
+            # Use optimized executor for Railway
             loop = asyncio.get_event_loop()
             response = await loop.run_in_executor(
-                None, 
+                executor, 
                 lambda: speech_client.recognize(config=config, audio=audio)
             )
             
@@ -358,7 +472,7 @@ async def call_php_chatbot(message: str, session_id: Optional[str] = None) -> di
 
         response = await asyncio.wait_for(
             asyncio.get_event_loop().run_in_executor(
-                None, 
+                executor, 
                 lambda: requests.post(CHATBOT_URL, json=payload, headers=headers, timeout=30)
             ),
             timeout=35
@@ -418,7 +532,6 @@ def text_to_speech(text: str, language_code: str) -> Optional[str]:
         logger.error(f"Text-to-speech conversion failed for {language_code}: {e}")
         return None
 
-# API Endpoints (keep exactly as before)
 @app.post("/api/voice")
 async def process_voice(
     audio: UploadFile = File(...),
@@ -426,10 +539,18 @@ async def process_voice(
 ):
     """Main voice processing endpoint"""
     try:
+        # Check memory before processing
+        memory_usage = check_memory_usage()
+        if memory_usage > 85:
+            raise HTTPException(
+                status_code=503, 
+                detail="Mfumo umejaa kwa sasa. Tafadhali jaribu tena baada ya dakika chache."
+            )
+        
         if speech_client is None or tts_client is None:
             raise HTTPException(
                 status_code=503, 
-                detail="Voice service temporarily unavailable. Please try again later."
+                detail="Huduma ya sauti haipatikani kwa sasa. Tafadhali jaribu tena baadaye."
             )
         
         if not audio.content_type or not audio.content_type.startswith('audio/'):
@@ -438,12 +559,12 @@ async def process_voice(
         audio_content = await audio.read()
         
         if len(audio_content) > MAX_AUDIO_SIZE:
-            raise HTTPException(status_code=400, detail="Faili la sauti ni kubwa sana (max 10MB)")
+            raise HTTPException(status_code=400, detail=f"Faili la sauti ni kubwa sana (kikomo ni {MAX_AUDIO_SIZE//1024//1024}MB)")
         
         if len(audio_content) < 1000:
             raise HTTPException(status_code=400, detail="Rekodi ni fupi sana. Rekodi kwa muda mrefu zaidi.")
 
-        logger.info(f"Processing voice request: {len(audio_content)} bytes, session: {session_id}")
+        logger.info(f"Processing voice request: {len(audio_content)} bytes, session: {session_id}, memory: {memory_usage}%")
 
         # Step 1: Speech to Text
         try:
@@ -478,6 +599,7 @@ async def process_voice(
             "reply": reply_text,
             "session_id": new_session_id,
             "language": reply_language,
+            "memory_usage": f"{memory_usage}%",
         }
         
         if audio_base64:
@@ -485,6 +607,7 @@ async def process_voice(
         else:
             response_data["warning"] = "Sauti haijapatikana, lakini jibu la maandishi lipo"
 
+        logger.info(f"Request completed successfully. Memory: {check_memory_usage()}%")
         return JSONResponse(response_data)
 
     except HTTPException:
@@ -524,43 +647,59 @@ async def chatbot_endpoint(request_data: ChatbotRequest):
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
+    """Enhanced health check for Railway"""
     try:
+        # System metrics
+        memory = psutil.virtual_memory()
+        disk = psutil.disk_usage('/')
+        
+        # Google Cloud status
         google_status = "connected" if speech_client and tts_client else "disconnected"
         
-        test_response = await call_php_chatbot("test")
+        # PHP chatbot status
+        test_response = await call_php_chatbot("healthcheck")
         php_status = "connected" if test_response.get("success") else "error"
         
+        # Overall status
+        status = "healthy" if google_status == "connected" and php_status == "connected" and memory.percent < 90 else "degraded"
+        
         return {
-            "status": "healthy" if google_status == "connected" and php_status == "connected" else "degraded",
+            "status": status,
             "service": "AgriWatt Voice Bot",
+            "platform": "Railway",
+            "memory_usage": f"{memory.percent}%",
+            "disk_usage": f"{disk.percent}%",
             "google_cloud": google_status,
             "php_chatbot": php_status,
-            "php_chatbot_url": CHATBOT_URL
+            "environment": os.getenv("RAILWAY_ENVIRONMENT", "development"),
+            "timestamp": datetime.now().isoformat()
         }
     except Exception as e:
         return {
-            "status": "degraded",
-            "service": "AgriWatt Voice Bot", 
-            "google_cloud": "disconnected",
-            "php_chatbot": "disconnected",
-            "error": str(e)
+            "status": "unhealthy",
+            "error": str(e),
+            "platform": "Railway",
+            "timestamp": datetime.now().isoformat()
         }
 
 @app.get("/")
 async def root():
     """Root endpoint with API information"""
     google_status = "connected" if speech_client and tts_client else "disconnected"
+    memory_usage = check_memory_usage()
     
     return {
         "message": "AgriWatt Voice Bot API",
         "version": "1.0.0",
         "description": "Voice interface for AgriWatt Hub chatbot",
         "status": google_status,
+        "platform": "Railway",
+        "memory_usage": f"{memory_usage}%",
         "endpoints": {
             "voice": "/api/voice (POST)",
             "chatbot": "/api/chatbot (POST)", 
-            "health": "/health (GET)"
+            "health": "/health (GET)",
+            "docs": "/docs (GET)"
         },
         "backend": CHATBOT_URL
     }
@@ -573,8 +712,10 @@ async def voice_feedback(
 ):
     """Collect user feedback to improve STT accuracy"""
     try:
+        # Ensure logs directory exists
         os.makedirs('logs', exist_ok=True)
         
+        # Log the correction for analysis
         logger.info(f"STT Correction - Original: '{original_transcript}' -> Corrected: '{corrected_text}'")
         
         feedback_data = {
@@ -596,5 +737,44 @@ async def voice_feedback(
         logger.error(f"Feedback error: {e}")
         return JSONResponse({"success": False, "message": "Feedback failed"})
 
+@app.get("/metrics")
+async def metrics():
+    """System metrics endpoint for monitoring"""
+    try:
+        memory = psutil.virtual_memory()
+        disk = psutil.disk_usage('/')
+        cpu = psutil.cpu_percent(interval=0.1)
+        
+        return {
+            "memory": {
+                "total": memory.total,
+                "available": memory.available,
+                "percent": memory.percent,
+                "used": memory.used
+            },
+            "disk": {
+                "total": disk.total,
+                "used": disk.used,
+                "free": disk.free,
+                "percent": disk.percent
+            },
+            "cpu": cpu,
+            "google_clients": "initialized" if speech_client and tts_client else "not_initialized",
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
 if __name__ == "__main__":
+    # Initialize for local development
+    initialize_google_clients()
+    
+    if is_port_in_use(PORT):
+        print(f"⚠️  Port {PORT} is already in use!")
+        print("💡 Try these solutions:")
+        print(f"   1. Kill existing process: sudo lsof -t -i:{PORT} | xargs kill -9")
+        print(f"   2. Use different port: PORT=8001 python main.py")
+        exit(1)
+    
+    print(f"🚀 Starting AgriWatt Voice Server on port {PORT}...")
     uvicorn.run(app, host="0.0.0.0", port=PORT, reload=False)
