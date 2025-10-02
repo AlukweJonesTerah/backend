@@ -77,7 +77,7 @@ app.add_middleware(
 )
 
 # Environment variables
-CHATBOT_URL = os.getenv("CHATBOT_URL", "https://your-domain.com/CompanyWeb1/chatbot-api.php")
+CHATBOT_URL = os.getenv("CHATBOT_URL", "https://agriwatthub.com/chatbot-api.php")
 MAX_AUDIO_SIZE = int(os.getenv("MAX_AUDIO_SIZE", 5 * 1024 * 1024))  # 5MB limit for Railway
 PORT = int(os.getenv("PORT", 8000))
 
