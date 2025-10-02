@@ -657,39 +657,25 @@ async def chatbot_endpoint(request_data: ChatbotRequest):
 
 @app.get("/health")
 async def health_check():
-    """Enhanced health check for Railway"""
+    """Health check endpoint"""
     try:
-        # System metrics
-        memory = psutil.virtual_memory()
-        disk = psutil.disk_usage('/')
-        
-        # Google Cloud status
-        google_status = "connected" if speech_client and tts_client else "disconnected"
-        
-        # PHP chatbot status
-        test_response = await call_php_chatbot("healthcheck")
+        # Test PHP chatbot connectivity
+        test_response = await call_php_chatbot("test")
         php_status = "connected" if test_response.get("success") else "error"
         
-        # Overall status
-        status = "healthy" if google_status == "connected" and php_status == "connected" and memory.percent < 90 else "degraded"
-        
         return {
-            "status": status,
+            "status": "healthy",
             "service": "AgriWatt Voice Bot",
-            "platform": "Railway",
-            "memory_usage": f"{memory.percent}%",
-            "disk_usage": f"{disk.percent}%",
-            "google_cloud": google_status,
             "php_chatbot": php_status,
-            "environment": os.getenv("RAILWAY_ENVIRONMENT", "development"),
-            "timestamp": datetime.now().isoformat()
+            "php_chatbot_url": CHATBOT_URL,  # This will now show your production URL
+            "python_server": "web-production-39e82.up.railway.app"
         }
     except Exception as e:
         return {
-            "status": "unhealthy",
-            "error": str(e),
-            "platform": "Railway",
-            "timestamp": datetime.now().isoformat()
+            "status": "degraded",
+            "service": "AgriWatt Voice Bot", 
+            "php_chatbot": "disconnected",
+            "error": str(e)
         }
 
 @app.get("/")
