@@ -1,0 +1,12 @@
+__pycache__
+.git
+.gitignore
+.env
+google-credentials.json
+*.pyc
+*.pyo
+*.pyd
+.vscode
+.idea
+logs
+*.log

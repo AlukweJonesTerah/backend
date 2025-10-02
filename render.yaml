@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: agriwatt-voice-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.3
+      - key: GOOGLE_CREDENTIALS_BASE64
+        fromSecret: GOOGLE_CREDENTIALS_BASE64
+      - key: CHATBOT_URL
+        value: https://your-domain.com/CompanyWeb1/chatbot-api.php
