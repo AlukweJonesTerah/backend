@@ -4,7 +4,7 @@ builder = "nixpacks"
 [deploy]
 numReplicas = 1
 # FIX: changed ${PORT} -> $PORT
-startCommand = "uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1"
+startCommand = "python main.py"
 
 [variables]
 WEB_CONCURRENCY = "1"

@@ -785,13 +785,6 @@ if __name__ == "__main__":
         print(f"⚠️ Invalid PORT value '{port_env}', falling back to 8000")
         PORT = 8000
 
-    if is_port_in_use(PORT):
-        print(f"⚠️  Port {PORT} is already in use!")
-        print("💡 Try these solutions:")
-        print(f"   1. Kill existing process: sudo lsof -t -i:{PORT} | xargs kill -9")
-        print(f"   2. Use different port: PORT=8001 python main.py")
-        exit(1)
-    
-    print(f"🚀 Starting AgriWatt Voice Server on port {PORT}...")
     uvicorn.run(app, host="0.0.0.0", port=PORT, reload=False)
+
 
