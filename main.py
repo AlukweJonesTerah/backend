@@ -256,10 +256,15 @@ async def process_audio_to_text(audio_content: bytes, content_type: str = "audio
     
     try:
         memory_usage = check_memory_usage()
+        
+        # Process audio and determine actual encoding
+        original_content_type = content_type
         if memory_usage > 80:
             audio_content = reduce_audio_quality(audio_content)
+            content_type = "audio/wav"  # Reduction converts to WAV
         else:
             audio_content = enhance_audio_quality(audio_content)
+            content_type = "audio/wav"  # Enhancement converts to WAV
 
         if len(audio_content) < 1000:
             raise HTTPException(status_code=400, detail="Audio too short")
@@ -285,13 +290,15 @@ async def process_audio_to_text(audio_content: bytes, content_type: str = "audio
         # Prepare audio
         audio_base64 = base64.b64encode(audio_content).decode('utf-8')
         
-        # Map content type to encoding
+        # Map content type to encoding (after processing)
         encoding_map = {
             'audio/webm': 'WEBM_OPUS',
             'audio/wav': 'LINEAR16',
             'audio/mpeg': 'MP3',
         }
-        encoding = encoding_map.get(content_type, 'WEBM_OPUS')
+        encoding = encoding_map.get(content_type, 'LINEAR16')
+        
+        logger.info(f"Audio encoding: {encoding} (original: {original_content_type}, processed: {content_type})")
         
         # Build request
         request_payload = {
