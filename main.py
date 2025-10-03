@@ -785,6 +785,14 @@ if __name__ == "__main__":
         print(f"⚠️ Invalid PORT value '{port_env}', falling back to 8000")
         PORT = 8000
 
-    uvicorn.run(app, host="0.0.0.0", port=PORT, reload=False)
-
-
+    # Start server
+    print(f"🚀 Starting AgriWatt Voice Server on port {PORT}...")
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=PORT,
+        reload=False,     # disable autoreload (saves memory)
+        workers=1,        # single worker only
+        loop="asyncio",   # lighter event loop
+        http="h11"        # force h11 (lighter than httptools)
+    )
