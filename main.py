@@ -437,21 +437,28 @@ async def process_voice(
     try:
         memory_usage = check_memory_usage()
         if memory_usage > 85:
+            logger.error(f"Memory overload: {memory_usage}%")
             raise HTTPException(status_code=503, detail="System overloaded")
         
         if not audio.content_type or not audio.content_type.startswith('audio/'):
+            logger.error(f"Invalid content type: {audio.content_type}")
             raise HTTPException(status_code=400, detail="Invalid audio file")
         
         audio_content = await audio.read()
+        logger.info(f"Received audio: {len(audio_content)} bytes, type: {audio.content_type}")
         
         if len(audio_content) > MAX_AUDIO_SIZE:
+            logger.error(f"Audio too large: {len(audio_content)} bytes")
             raise HTTPException(status_code=400, detail="Audio file too large")
         
         if len(audio_content) < 1000:
-            raise HTTPException(status_code=400, detail="Audio too short")
+            logger.error(f"Audio too short: {len(audio_content)} bytes")
+            raise HTTPException(status_code=400, detail="Audio too short - speak for at least 3 seconds")
 
         # Speech to Text
+        logger.info("Starting speech-to-text processing...")
         transcript = await process_audio_to_text(audio_content, audio.content_type)
+        logger.info(f"Transcript: {transcript}")
 
         # Call PHP Chatbot
         chatbot_response = await call_php_chatbot(transcript, session_id)
@@ -477,11 +484,12 @@ async def process_voice(
 
         return JSONResponse(response_data)
 
-    except HTTPException:
+    except HTTPException as e:
+        logger.error(f"HTTP Exception: {e.status_code} - {e.detail}")
         raise
     except Exception as e:
-        logger.error(f"Voice processing error: {e}")
-        raise HTTPException(status_code=500, detail="Internal error")
+        logger.error(f"Voice processing error: {type(e).__name__} - {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
 
 @app.post("/api/chatbot")
 async def chatbot_endpoint(request_data: ChatbotRequest):
