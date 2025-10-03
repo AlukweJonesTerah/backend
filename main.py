@@ -40,6 +40,7 @@ if os.getenv("RAILWAY_ENVIRONMENT"):
 
     os.environ["GRPC_ENABLE_FORK_SUPPORT"] = "False"
     os.environ["GRPC_POLL_STRATEGY"] = "poll"
+    os.environ["GRPC_DEFAULT_THREADPOOL_SIZE"] = "1" # Limit gRPC to single thread
 
     if resource:
         try:
