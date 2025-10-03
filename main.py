@@ -86,7 +86,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Environment variables
+# Environment variables - FIXED: Use consistent chatbot URL
 CHATBOT_URL = os.getenv("CHATBOT_URL", "https://agriwatthub.com/chatbot-api.php")
 MAX_AUDIO_SIZE = int(os.getenv("MAX_AUDIO_SIZE", 5 * 1024 * 1024))  # 5MB limit for Railway
 PORT = int(os.getenv("PORT", 8000))
@@ -176,16 +176,15 @@ async def startup_event():
     # Initialize Google clients
     initialize_google_clients()
     
-    # Pre-warm Google Cloud clients
-    if speech_client:
-        try:
-            # Test speech client (this will warm up the connection)
-            await asyncio.get_event_loop().run_in_executor(
-                executor, 
-                lambda: speech_client.get_operation(name="test")
-            )
-        except Exception as e:
-            logger.info("Google Cloud clients warmed up (expected test failure)")
+    # Test PHP chatbot connection
+    try:
+        test_response = await call_php_chatbot("test", "startup-test")
+        if test_response.get("success"):
+            logger.info("✅ PHP chatbot connection successful")
+        else:
+            logger.warning(f"⚠️ PHP chatbot test failed: {test_response.get('reply', 'Unknown error')}")
+    except Exception as e:
+        logger.error(f"❌ PHP chatbot connection test failed: {e}")
     
     logger.info(f"✅ AgriWatt Voice Bot ready on port {PORT}")
     logger.info(f"✅ Memory usage: {check_memory_usage()}%")
@@ -465,7 +464,7 @@ def extract_audio_metadata(audio_path: str) -> dict:
         return {"sample_rate_hertz": 48000, "audio_channel_count": 2}
     
 async def call_php_chatbot(message: str, session_id: Optional[str] = None) -> dict:
-    """Call the PHP chatbot backend and return the complete response"""
+    """Call the PHP chatbot backend and return the complete response - FIXED VERSION"""
     try:
         payload = {"message": message}
         if session_id:
@@ -489,19 +488,63 @@ async def call_php_chatbot(message: str, session_id: Optional[str] = None) -> di
         )
 
         logger.info(f"PHP chatbot response status: {response.status_code}")
-        response.raise_for_status()
         
-        return response.json()
+        # Check if response is successful
+        if response.status_code != 200:
+            logger.error(f"PHP chatbot returned non-200 status: {response.status_code}")
+            return {
+                "success": False, 
+                "reply": f"Samahani, mfumo wa mazungumzo unakabiliwa na shida. Tafadhali jaribu tena baadaye. (Status: {response.status_code})"
+            }
+        
+        # Try to parse JSON response
+        try:
+            response_data = response.json()
+            
+            # Ensure the response has the expected structure
+            if not isinstance(response_data, dict):
+                logger.error(f"PHP chatbot returned non-dict response: {type(response_data)}")
+                return {
+                    "success": False,
+                    "reply": "Samahani, jibu lisilotarajiwa limepokelewa kutoka kwa mfumo wa mazungumzo."
+                }
+            
+            # Ensure success field exists
+            if 'success' not in response_data:
+                response_data['success'] = True  # Assume success if not specified
+                
+            # Ensure reply field exists
+            if 'reply' not in response_data:
+                response_data['reply'] = "Samahani, hakuna jibu lililopokelewa."
+                
+            return response_data
+            
+        except ValueError as e:
+            logger.error(f"Failed to parse PHP chatbot JSON response: {e}")
+            logger.error(f"Response content: {response.text[:200]}...")
+            return {
+                "success": False,
+                "reply": "Samahani, jibu lisilotarajiwa limepokelewa kutoka kwa mfumo wa mazungumzo."
+            }
         
     except asyncio.TimeoutError:
         logger.error("PHP chatbot request timed out")
-        return {"success": False, "reply": "Samahani, mfumo umechelewa. Jaribu tena baadaye."}
+        return {
+            "success": False, 
+            "reply": "Samahani, mfumo umechelewa kukupatia jibu. Tafadhali jaribu tena baadaye."
+        }
     except requests.RequestException as e:
         logger.error(f"PHP chatbot request failed: {e}")
-        return {"success": False, "reply": "Samahani, kuna tatizo la kimtandao. Jaribu tena."}
+        return {
+            "success": False, 
+            "reply": f"Samahani, kuna tatizo la kimtandao. Tafadhali jaribu tena. (Error: {str(e)})"
+        }
     except Exception as e:
         logger.error(f"Unexpected error calling PHP chatbot: {e}")
-        return {"success": False, "reply": "Samahani, kuna hitilafu. Jaribu tena."}
+        return {
+            "success": False, 
+            "reply": "Samahani, kuna hitilafu isiyotarajiwa. Tafadhali jaribu tena."
+        }
 
 def text_to_speech(text: str, language_code: str) -> Optional[str]:
     """Convert text to speech with multilingual support"""
@@ -657,7 +700,7 @@ async def chatbot_endpoint(request_data: ChatbotRequest):
 
 @app.get("/health")
 async def health_check():
-    """Enhanced health check for Railway"""
+    """Enhanced health check for Railway - FIXED VERSION"""
     try:
         # System metrics
         memory = psutil.virtual_memory()
@@ -666,14 +709,22 @@ async def health_check():
         # Google Cloud status
         google_status = "connected" if speech_client and tts_client else "disconnected"
         
-        # PHP chatbot status
-        test_response = await call_php_chatbot("healthcheck")
-        php_status = "connected" if test_response.get("success") else "error"
+        # PHP chatbot status - FIXED: Better error handling
+        try:
+            test_response = await call_php_chatbot("hello")
+            php_status = "connected" if test_response.get("success") else "error"
+            php_error = None if test_response.get("success") else test_response.get("reply", "Unknown error")
+        except Exception as e:
+            php_status = "error"
+            php_error = str(e)
         
-        # Overall status
-        status = "healthy" if google_status == "connected" and php_status == "connected" and memory.percent < 90 else "degraded"
+        # Overall status - make it more forgiving for PHP chatbot errors
+        if google_status == "connected" and memory.percent < 90:
+            status = "healthy" if php_status == "connected" else "degraded"
+        else:
+            status = "unhealthy"
         
-        return {
+        health_data = {
             "status": status,
             "service": "AgriWatt Voice Bot",
             "platform": "Railway",
@@ -684,6 +735,13 @@ async def health_check():
             "environment": os.getenv("RAILWAY_ENVIRONMENT", "development"),
             "timestamp": datetime.now().isoformat()
         }
+        
+        # Add PHP error details if available
+        if php_error:
+            health_data["php_error"] = php_error
+            
+        return health_data
+        
     except Exception as e:
         return {
             "status": "unhealthy",
