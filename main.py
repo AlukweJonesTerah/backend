@@ -10,6 +10,7 @@ from pydub import AudioSegment
 from datetime import datetime
 import json
 import resource
+import psutil  
 
 def check_memory_usage():
     """Simple memory check without psutil"""
