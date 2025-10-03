@@ -11,6 +11,7 @@ from datetime import datetime
 import json
 import psutil
 import aiohttp
+import httpx
 
 # Safe import for Linux-only resource module
 try:
@@ -82,49 +83,34 @@ tts_client = None
 def initialize_google_clients():
     global speech_client, tts_client
     try:
-        # Method 1: Base64 encoded credentials (Recommended for Railway)
         creds_base64 = os.getenv("GOOGLE_CREDENTIALS_BASE64")
         if creds_base64:
             import base64
             from google.oauth2 import service_account
-            
             creds_json = base64.b64decode(creds_base64).decode('utf-8')
             credentials = service_account.Credentials.from_service_account_info(
-                json.loads(creds_json)
-            )
-            speech_client = speech.SpeechClient(credentials=credentials)
-            tts_client = texttospeech.TextToSpeechClient(credentials=credentials)
-            logger.info("✅ Google Cloud clients initialized from environment variable")
-            return
-        
-        # Method 2: For local development
-        default_path = "./google-credentials.json"
-        if os.path.exists(default_path):
-            speech_client = speech.SpeechClient.from_service_account_file(default_path)
-            tts_client = texttospeech.TextToSpeechClient.from_service_account_file(default_path)
-            logger.info("✅ Google Cloud clients initialized from local file")
-            return
-            
-        logger.error("❌ No Google Cloud credentials found")
-        
+            json.loads(creds_json)
+        )
+        speech_client = speech.SpeechClient(credentials=credentials)
+        tts_client = texttospeech.TextToSpeechClient(credentials=credentials)
+        logger.info("✅ Google Cloud clients initialized from environment variable")
+        return
     except Exception as e:
         logger.error(f"❌ Failed to initialize Google Cloud clients: {e}")
 
-# Initialize on startup
+# --- Startup and Shutdown Events ---
 @app.on_event("startup")
 async def startup_event():
-    """Startup optimization for Railway"""
-    global session
+    global http_session
     logger.info("🚆 Starting AgriWatt Voice Bot on Railway")
 
     # Initialize Google clients
     initialize_google_clients()
 
-    # Create one aiohttp session for all PHP chatbot calls
-    if session is None:
-        timeout = aiohttp.ClientTimeout(total=30)
-        session = aiohttp.ClientSession(timeout=timeout)
-        logger.info("✅ Global aiohttp session created")
+    # Create one httpx session for all PHP chatbot calls
+    if http_session is None:
+        http_session = httpx.AsyncClient(timeout=30)
+        logger.info("✅ Global httpx session created")
 
     # Test PHP chatbot connection
     try:
@@ -137,18 +123,17 @@ async def startup_event():
         logger.error(f"❌ PHP chatbot connection test failed: {e}")
 
     logger.info(f"✅ AgriWatt Voice Bot ready on port {PORT}")
-    logger.info(f"✅ Memory usage: {check_memory_usage()}%")
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Cleanup on shutdown"""
-    global session
-    if session:
-        await session.close()
-        logger.info("🛑 aiohttp session closed")
+    global http_session
+    if http_session:
+        await http_session.aclose()
+        logger.info("🛑 httpx session closed")
 
+# --- PHP Chatbot Call ---
 async def call_php_chatbot(message: str, session_id: Optional[str] = None) -> dict:
-    global session
+    global http_session
     try:
         payload = {"message": message}
         if session_id:
@@ -824,23 +809,20 @@ async def metrics():
 
 if __name__ == "__main__":
     initialize_google_clients()
-    
-    # Safely parse PORT
     port_env = os.getenv("PORT", "8000")
     try:
         PORT = int(port_env)
     except ValueError:
         print(f"⚠️ Invalid PORT value '{port_env}', falling back to 8000")
-        PORT = 8000
+    PORT = 8000
 
-    # Start server
     print(f"🚀 Starting AgriWatt Voice Server on port {PORT}...")
     uvicorn.run(
         app,
         host="0.0.0.0",
         port=PORT,
-        reload=False,     # disable autoreload (saves memory)
-        workers=1,        # single worker only
-        loop="asyncio",   # lighter event loop
-        http="h11"        # force h11 (lighter than httptools)
+        reload=False,
+        workers=1,
+        loop="asyncio",
+        http="h11"
     )
