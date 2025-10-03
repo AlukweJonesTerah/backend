@@ -1,7 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from google.cloud import speech, texttospeech
 from langdetect import detect, DetectorFactory
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
@@ -30,35 +29,25 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Railway-specific optimizations - MUST BE SET BEFORE IMPORTING GOOGLE CLOUD
+# Railway-specific optimizations
 if os.getenv("RAILWAY_ENVIRONMENT"):
-    logger.info("🚆 Running on Railway - applying optimizations")
+    logger.info("Railway environment detected - applying optimizations")
     
-    # CRITICAL: Set these BEFORE importing Google Cloud libraries
     os.environ["GRPC_ENABLE_FORK_SUPPORT"] = "0"
     os.environ["GRPC_POLL_STRATEGY"] = "poll"
     os.environ["GRPC_VERBOSITY"] = "ERROR"
-    os.environ["GRPC_TRACE"] = ""
-    os.environ["GRPC_THREADS"] = "1"
-    os.environ["GRPC_DNS_RESOLVER"] = "native"
     
     if resource:
         try:
-            # Thread limit for Railway free tier
             resource.setrlimit(resource.RLIMIT_NPROC, (40, 80))
-            # Memory limit
             memory_limit = 450 * 1024 * 1024
             resource.setrlimit(resource.RLIMIT_AS, (memory_limit, memory_limit))
-            logger.info("Memory and thread limits set for Railway free tier")
+            logger.info("Memory and thread limits set")
         except Exception as e:
             logger.warning(f"Could not set resource limits: {e}")
 
 # Global variables
 http_session: Optional[httpx.AsyncClient] = None
-speech_client = None
-tts_client = None
-
-# Health check cache
 _health_cache = {
     "last_check": None,
     "php_status": "unknown",
@@ -71,73 +60,36 @@ class ChatbotRequest(BaseModel):
     message: str
     session_id: Optional[str] = None
 
-# Environment variables with better defaults
+# Environment variables
 CHATBOT_URL = os.getenv("CHATBOT_URL", "https://agriwatthub.com/chatbot-api.php")
-MAX_AUDIO_SIZE = int(os.getenv("MAX_AUDIO_SIZE", 10 * 1024 * 1024))  # Default 10MB
-MIN_AUDIO_SIZE = int(os.getenv("MIN_AUDIO_SIZE", 5000))  # Minimum 5KB
+MAX_AUDIO_SIZE = int(os.getenv("MAX_AUDIO_SIZE", 10 * 1024 * 1024))
+MIN_AUDIO_SIZE = int(os.getenv("MIN_AUDIO_SIZE", 5000))
 PORT = int(os.getenv("PORT", 8000))
 
-# Log configuration on startup
-logger.info(f"Configuration - MAX_AUDIO_SIZE: {MAX_AUDIO_SIZE} bytes ({MAX_AUDIO_SIZE/1024/1024:.1f}MB)")
-logger.info(f"Configuration - MIN_AUDIO_SIZE: {MIN_AUDIO_SIZE} bytes ({MIN_AUDIO_SIZE/1024:.1f}KB)")
-logger.info(f"Configuration - CHATBOT_URL: {CHATBOT_URL}")
-
-def initialize_google_clients():
-    """Lazy initialization of Google Cloud clients"""
-    global speech_client, tts_client
-    
-    if speech_client is not None and tts_client is not None:
-        return  # Already initialized
-    
-    try:
-        creds_base64 = os.getenv("GOOGLE_CREDENTIALS_BASE64")
-        if not creds_base64:
-            logger.error("GOOGLE_CREDENTIALS_BASE64 not set")
-            return
-            
-        from google.oauth2 import service_account
-        creds_json = base64.b64decode(creds_base64).decode('utf-8')
-        credentials = service_account.Credentials.from_service_account_info(
-            json.loads(creds_json)
-        )
-        
-        # Initialize with minimal gRPC channels
-        speech_client = speech.SpeechClient(credentials=credentials)
-        tts_client = texttospeech.TextToSpeechClient(credentials=credentials)
-        logger.info("✅ Google Cloud clients initialized")
-        
-    except Exception as e:
-        logger.error(f"❌ Failed to initialize Google Cloud clients: {e}")
+logger.info(f"MAX_AUDIO_SIZE: {MAX_AUDIO_SIZE/1024/1024:.1f}MB")
+logger.info(f"MIN_AUDIO_SIZE: {MIN_AUDIO_SIZE/1024:.1f}KB")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Modern FastAPI lifespan handler"""
     global http_session
     
-    logger.info("🚆 Starting AgriWatt Voice Bot on Railway")
+    logger.info("Starting AgriWatt Voice Bot")
     
-    # Lazy initialization - only create clients when needed
-    logger.info("⏭️ Deferring Google Cloud client initialization")
-    
-    # Create httpx session with strict limits
     http_session = httpx.AsyncClient(
         timeout=30,
         limits=httpx.Limits(max_connections=3, max_keepalive_connections=1)
     )
-    logger.info("✅ Global httpx session created")
-    logger.info(f"✅ AgriWatt Voice Bot ready on port {PORT}")
+    logger.info(f"Service ready on port {PORT}")
     
-    yield  # Application runs here
+    yield
     
-    # Cleanup
     if http_session:
         await http_session.aclose()
-        logger.info("🛑 httpx session closed")
+        logger.info("httpx session closed")
 
-# Create FastAPI app with lifespan
 app = FastAPI(
     title="AgriWatt Voice Bot API", 
-    version="1.0.0",
+    version="1.0.3",
     docs_url="/docs",
     redoc_url="/redoc",
     lifespan=lifespan
@@ -152,7 +104,6 @@ app.add_middleware(
 )
 
 async def call_php_chatbot(message: str, session_id: Optional[str] = None) -> dict:
-    """Call PHP chatbot API"""
     global http_session
     
     try:
@@ -167,39 +118,32 @@ async def call_php_chatbot(message: str, session_id: Optional[str] = None) -> di
         }
 
         if not http_session:
-            http_session = httpx.AsyncClient(
-                timeout=30,
-                limits=httpx.Limits(max_connections=3, max_keepalive_connections=1)
-            )
+            http_session = httpx.AsyncClient(timeout=30)
 
         response = await http_session.post(CHATBOT_URL, json=payload, headers=headers)
 
         if response.status_code != 200:
-            return {"success": False, "reply": "Samahani, mfumo wa mazungumzo unakabiliwa na shida."}
+            return {"success": False, "reply": "Service temporarily unavailable."}
 
         response_data = response.json()
         if not isinstance(response_data, dict):
-            return {"success": False, "reply": "Samahani, jibu lisilotarajiwa."}
+            return {"success": False, "reply": "Invalid response."}
 
         response_data.setdefault("success", True)
-        response_data.setdefault("reply", "Samahani, hakuna jibu.")
+        response_data.setdefault("reply", "No response available.")
         return response_data
 
-    except httpx.TimeoutException:
-        return {"success": False, "reply": "Samahani, mfumo umechelewa."}
     except Exception as e:
         logger.error(f"PHP chatbot error: {e}")
-        return {"success": False, "reply": "Samahani, kuna hitilafu isiyotarajiwa."}
+        return {"success": False, "reply": "Service error."}
 
 def check_memory_usage():
-    """Check memory usage"""
     try:
         return psutil.virtual_memory().percent
     except:
         return 0
 
 def reduce_audio_quality(audio_content: bytes) -> bytes:
-    """Reduce audio quality for memory optimization"""
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_in:
             temp_in.write(audio_content)
@@ -224,14 +168,12 @@ def reduce_audio_quality(audio_content: bytes) -> bytes:
         return audio_content
 
 def enhanced_language_detection(text: str) -> str:
-    """Enhanced language detection"""
     try:
         return detect(text.lower())
     except:
         return 'en'
 
 def convert_audio_format(audio_content: bytes, target_format: str = "wav") -> bytes:
-    """Convert audio format"""
     try:
         if check_memory_usage() > 70:
             audio_content = reduce_audio_quality(audio_content)
@@ -260,15 +202,7 @@ def convert_audio_format(audio_content: bytes, target_format: str = "wav") -> by
         logger.error(f"Audio conversion error: {e}")
         return audio_content
 
-def get_speech_context():
-    """Domain-specific speech context"""
-    return speech.SpeechContext(phrases=[
-        "agriwatt", "agriculture", "farming", "kenya", "crops", "irrigation", 
-        "solar", "maize", "coffee", "tea", "smart farming"
-    ])
-
 def correct_domain_terms(transcript: str) -> str:
-    """Correct common misrecognitions"""
     corrections = {
         "agree what": "agriwatt",
         "agree watt": "agriwatt",
@@ -282,17 +216,15 @@ def correct_domain_terms(transcript: str) -> str:
     return transcript
 
 def get_voice_config(language_code: str) -> tuple:
-    """Get voice configuration"""
     voice_map = {
-        'en': ('en-US-Wavenet-F', texttospeech.SsmlVoiceGender.FEMALE, 'en-US'),
-        'sw': ('en-US-Wavenet-D', texttospeech.SsmlVoiceGender.MALE, 'en-US'),
-        'fr': ('fr-FR-Wavenet-A', texttospeech.SsmlVoiceGender.FEMALE, 'fr-FR'),
-        'es': ('es-ES-Wavenet-B', texttospeech.SsmlVoiceGender.MALE, 'es-ES'),
+        'en': ('en-US-Wavenet-F', 'FEMALE', 'en-US'),
+        'sw': ('en-US-Wavenet-D', 'MALE', 'en-US'),
+        'fr': ('fr-FR-Wavenet-A', 'FEMALE', 'fr-FR'),
+        'es': ('es-ES-Wavenet-B', 'MALE', 'es-ES'),
     }
     return voice_map.get(language_code, voice_map['en'])
 
 def enhance_audio_quality(audio_content: bytes) -> bytes:
-    """Enhance audio quality"""
     try:
         if check_memory_usage() > 75:
             return audio_content
@@ -319,13 +251,8 @@ def enhance_audio_quality(audio_content: bytes) -> bytes:
         return audio_content
 
 async def process_audio_to_text(audio_content: bytes, content_type: str = "audio/webm") -> str:
-    """Convert audio to text"""
-    # Initialize Google clients on first use (lazy initialization)
-    if speech_client is None:
-        initialize_google_clients()
-    
-    if speech_client is None:
-        raise HTTPException(status_code=503, detail="Speech service unavailable")
+    """Convert audio to text using Google Cloud Speech REST API"""
+    global http_session
     
     try:
         memory_usage = check_memory_usage()
@@ -337,97 +264,161 @@ async def process_audio_to_text(audio_content: bytes, content_type: str = "audio
         if len(audio_content) < 1000:
             raise HTTPException(status_code=400, detail="Audio too short")
         
-        format_map = {
-            'audio/webm': 'webm',
-            'audio/wav': 'wav', 
-            'audio/mpeg': 'mp3',
-        }
+        # Get credentials
+        creds_base64 = os.getenv("GOOGLE_CREDENTIALS_BASE64")
+        if not creds_base64:
+            raise HTTPException(status_code=503, detail="Speech service not configured")
         
-        file_ext = format_map.get(content_type, 'webm')
+        from google.oauth2 import service_account
+        from google.auth.transport.requests import Request
         
-        if content_type not in ['audio/webm', 'audio/wav']:
-            audio_content = convert_audio_format(audio_content, "wav")
-            file_ext = 'wav'
-        
-        encoding_map = {
-            'webm': speech.RecognitionConfig.AudioEncoding.WEBM_OPUS,
-            'wav': speech.RecognitionConfig.AudioEncoding.LINEAR16,
-            'mp3': speech.RecognitionConfig.AudioEncoding.MP3,
-        }
-        
-        encoding = encoding_map.get(file_ext, speech.RecognitionConfig.AudioEncoding.WEBM_OPUS)
-        
-        audio = speech.RecognitionAudio(content=audio_content)
-        config = speech.RecognitionConfig(
-            encoding=encoding,
-            sample_rate_hertz=16000,
-            audio_channel_count=1,
-            language_code="en-US",
-            alternative_language_codes=["sw-KE", "fr-FR", "es-ES"],
-            enable_automatic_punctuation=True,
-            model="default",
-            use_enhanced=True,
-            speech_contexts=[get_speech_context()] 
+        creds_json = base64.b64decode(creds_base64).decode('utf-8')
+        credentials = service_account.Credentials.from_service_account_info(
+            json.loads(creds_json)
         )
         
-        # Use asyncio.to_thread for async gRPC call
-        response = await asyncio.to_thread(speech_client.recognize, config=config, audio=audio)
+        # Get access token
+        credentials.refresh(Request())
+        access_token = credentials.token
         
-        if not response.results:
+        # Prepare audio
+        audio_base64 = base64.b64encode(audio_content).decode('utf-8')
+        
+        # Map content type to encoding
+        encoding_map = {
+            'audio/webm': 'WEBM_OPUS',
+            'audio/wav': 'LINEAR16',
+            'audio/mpeg': 'MP3',
+        }
+        encoding = encoding_map.get(content_type, 'WEBM_OPUS')
+        
+        # Build request
+        request_payload = {
+            "config": {
+                "encoding": encoding,
+                "sampleRateHertz": 16000,
+                "audioChannelCount": 1,
+                "languageCode": "en-US",
+                "alternativeLanguageCodes": ["sw-KE", "fr-FR", "es-ES"],
+                "enableAutomaticPunctuation": True,
+                "model": "default",
+                "useEnhanced": True,
+                "speechContexts": [{
+                    "phrases": [
+                        "agriwatt", "agriculture", "farming", "kenya", "crops", 
+                        "irrigation", "solar", "maize", "coffee", "tea"
+                    ]
+                }]
+            },
+            "audio": {
+                "content": audio_base64
+            }
+        }
+        
+        # Make REST API call
+        api_url = "https://speech.googleapis.com/v1/speech:recognize"
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json"
+        }
+        
+        if not http_session:
+            http_session = httpx.AsyncClient(timeout=30)
+        
+        logger.info("Calling Google Speech API (REST)...")
+        response = await http_session.post(api_url, json=request_payload, headers=headers)
+        
+        if response.status_code != 200:
+            logger.error(f"Google API error: {response.status_code} - {response.text}")
+            raise HTTPException(status_code=400, detail="Speech recognition failed")
+        
+        result = response.json()
+        
+        if not result.get("results"):
             raise HTTPException(status_code=400, detail="No speech detected")
         
-        transcript = response.results[0].alternatives[0].transcript
+        transcript = result["results"][0]["alternatives"][0]["transcript"]
         transcript = correct_domain_terms(transcript)
-        confidence = response.results[0].alternatives[0].confidence
+        confidence = result["results"][0]["alternatives"][0].get("confidence", 0.0)
         
-        logger.info(f"STT: '{transcript}' (Confidence: {confidence:.2f})")
-        
-        if confidence < 0.5:
-            raise HTTPException(status_code=400, detail="Low confidence")
+        logger.info(f"Transcript: '{transcript}' (Confidence: {confidence:.2f})")
         
         return transcript.strip()
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Speech recognition error: {e}")
+        logger.error(f"Speech recognition error: {e}", exc_info=True)
         raise HTTPException(status_code=400, detail="Speech recognition failed")
 
-def text_to_speech(text: str, language_code: str) -> Optional[str]:
-    """Convert text to speech"""
-    # Initialize Google clients on first use
-    if tts_client is None:
-        initialize_google_clients()
-    
-    if tts_client is None:
-        return None
+async def text_to_speech(text: str, language_code: str) -> Optional[str]:
+    """Convert text to speech using Google Cloud TTS REST API"""
+    global http_session
     
     try:
         if not text or not text.strip():
             return None
+        
+        # Get credentials
+        creds_base64 = os.getenv("GOOGLE_CREDENTIALS_BASE64")
+        if not creds_base64:
+            logger.error("GOOGLE_CREDENTIALS_BASE64 not set")
+            return None
             
-        synthesis_input = texttospeech.SynthesisInput(text=text)
+        from google.oauth2 import service_account
+        from google.auth.transport.requests import Request
+        
+        creds_json = base64.b64decode(creds_base64).decode('utf-8')
+        credentials = service_account.Credentials.from_service_account_info(
+            json.loads(creds_json)
+        )
+        
+        # Get access token
+        credentials.refresh(Request())
+        access_token = credentials.token
+        
         voice_name, voice_gender, tts_language = get_voice_config(language_code)
         
-        voice = texttospeech.VoiceSelectionParams(
-            language_code=tts_language,
-            name=voice_name,
-            ssml_gender=voice_gender
-        )
+        # Build request
+        request_payload = {
+            "input": {
+                "text": text
+            },
+            "voice": {
+                "languageCode": tts_language,
+                "name": voice_name,
+                "ssmlGender": voice_gender
+            },
+            "audioConfig": {
+                "audioEncoding": "MP3",
+                "speakingRate": 0.9,
+                "pitch": 0.0
+            }
+        }
         
-        audio_config = texttospeech.AudioConfig(
-            audio_encoding=texttospeech.AudioEncoding.MP3,
-            speaking_rate=0.9,
-            pitch=0.0
-        )
-
-        response = tts_client.synthesize_speech(
-            input=synthesis_input,
-            voice=voice,
-            audio_config=audio_config
-        )
-
-        return base64.b64encode(response.audio_content).decode('utf-8')
+        # Make REST API call
+        api_url = "https://texttospeech.googleapis.com/v1/text:synthesize"
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json"
+        }
+        
+        if not http_session:
+            http_session = httpx.AsyncClient(timeout=30)
+        
+        logger.info("Calling Google TTS API (REST)...")
+        response = await http_session.post(api_url, json=request_payload, headers=headers)
+        
+        if response.status_code != 200:
+            logger.error(f"Google TTS error: {response.status_code}")
+            return None
+        
+        result = response.json()
+        
+        if "audioContent" in result:
+            return result["audioContent"]
+        
+        return None
         
     except Exception as e:
         logger.error(f"TTS failed: {e}")
@@ -438,66 +429,57 @@ async def process_voice(
     audio: UploadFile = File(...),
     session_id: Optional[str] = Form(None)
 ):
-    """Main voice processing endpoint with enhanced logging"""
+    """Main voice processing endpoint"""
     try:
-        # Log configuration for debugging
-        logger.info(f"Audio size limits - MIN: {MIN_AUDIO_SIZE} bytes, MAX: {MAX_AUDIO_SIZE} bytes")
+        logger.info(f"Audio limits - MIN: {MIN_AUDIO_SIZE}, MAX: {MAX_AUDIO_SIZE}")
         
         memory_usage = check_memory_usage()
         if memory_usage > 85:
             logger.error(f"Memory overload: {memory_usage}%")
             raise HTTPException(status_code=503, detail="System overloaded")
         
-        # Validate content type
         if not audio.content_type or not audio.content_type.startswith('audio/'):
             logger.error(f"Invalid content type: {audio.content_type}")
-            raise HTTPException(status_code=400, detail="Invalid audio file - must be audio/* format")
+            raise HTTPException(status_code=400, detail="Invalid audio file")
         
-        # Read audio content
         audio_content = await audio.read()
         audio_size_kb = len(audio_content) / 1024
-        audio_size_mb = audio_size_kb / 1024
         
-        logger.info(f"📥 Received audio: {len(audio_content)} bytes ({audio_size_kb:.1f}KB / {audio_size_mb:.2f}MB)")
-        logger.info(f"📄 Content type: {audio.content_type}")
-        logger.info(f"📏 Size check: MIN={MIN_AUDIO_SIZE}, ACTUAL={len(audio_content)}, MAX={MAX_AUDIO_SIZE}")
+        logger.info(f"Received: {len(audio_content)} bytes ({audio_size_kb:.1f}KB)")
+        logger.info(f"Type: {audio.content_type}")
         
-        # Validate size constraints
         if len(audio_content) < MIN_AUDIO_SIZE:
-            logger.error(f"❌ Audio too short: {len(audio_content)} bytes (min: {MIN_AUDIO_SIZE})")
+            logger.error(f"Audio too short: {len(audio_content)}")
             raise HTTPException(
                 status_code=400, 
-                detail=f"Audio too short ({audio_size_kb:.1f}KB) - please speak for at least 3 seconds"
+                detail=f"Audio too short - speak for at least 3 seconds"
             )
         
         if len(audio_content) > MAX_AUDIO_SIZE:
-            logger.error(f"❌ Audio too large: {len(audio_content)} bytes (max: {MAX_AUDIO_SIZE})")
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Audio too large ({audio_size_mb:.1f}MB) - maximum is {MAX_AUDIO_SIZE/1024/1024:.1f}MB"
-            )
+            logger.error(f"Audio too large: {len(audio_content)}")
+            raise HTTPException(status_code=400, detail="Audio too large")
         
-        logger.info("✅ Audio size validation passed")
+        logger.info("Audio validation passed")
 
         # Speech to Text
-        logger.info("🎤 Starting speech-to-text processing...")
+        logger.info("Starting speech-to-text...")
         transcript = await process_audio_to_text(audio_content, audio.content_type)
-        logger.info(f"📝 Transcript received: '{transcript}'")
+        logger.info(f"Transcript: '{transcript}'")
 
         # Call PHP Chatbot
-        logger.info("🤖 Calling PHP chatbot...")
+        logger.info("Calling chatbot...")
         chatbot_response = await call_php_chatbot(transcript, session_id)
         
-        reply_text = chatbot_response.get("reply", "Samahani, sijapata jibu.")
+        reply_text = chatbot_response.get("reply", "No response available.")
         new_session_id = chatbot_response.get("session_id", session_id)
         success = chatbot_response.get("success", False)
         
-        logger.info(f"💬 Chatbot response received (success: {success})")
+        logger.info(f"Chatbot response received (success: {success})")
 
         # Text to Speech
-        logger.info("🔊 Generating audio response...")
+        logger.info("Generating audio response...")
         reply_language = enhanced_language_detection(reply_text)
-        audio_base64 = text_to_speech(reply_text, reply_language)
+        audio_base64 = await text_to_speech(reply_text, reply_language)
 
         response_data = {
             "success": success,
@@ -509,18 +491,16 @@ async def process_voice(
         
         if audio_base64:
             response_data["audio"] = audio_base64
-            logger.info("✅ Audio response generated successfully")
-        else:
-            logger.warning("⚠️ No audio response generated")
+            logger.info("Audio response generated")
 
-        logger.info("✅ Voice processing completed successfully")
+        logger.info("Voice processing completed")
         return JSONResponse(response_data)
 
     except HTTPException as e:
-        logger.error(f"❌ HTTP Exception: {e.status_code} - {e.detail}")
+        logger.error(f"HTTP Exception: {e.status_code} - {e.detail}")
         raise
     except Exception as e:
-        logger.error(f"❌ Unexpected error: {type(e).__name__} - {str(e)}", exc_info=True)
+        logger.error(f"Unexpected error: {type(e).__name__} - {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
 
 @app.post("/api/chatbot")
@@ -554,14 +534,12 @@ async def chatbot_endpoint(request_data: ChatbotRequest):
 
 @app.get("/health")
 async def health_check():
-    """Optimized health check with caching"""
+    """Health check endpoint"""
     global _health_cache
     
     try:
         memory = psutil.virtual_memory()
-        google_status = "connected" if speech_client and tts_client else "lazy_init"
         
-        # Cache PHP chatbot checks
         now = datetime.now()
         if (_health_cache["last_check"] is None or 
             (now - _health_cache["last_check"]).total_seconds() > HEALTH_CACHE_SECONDS):
@@ -582,7 +560,7 @@ async def health_check():
             "status": status,
             "service": "AgriWatt Voice Bot",
             "memory_usage": f"{memory.percent}%",
-            "google_cloud": google_status,
+            "google_cloud": "REST API",
             "php_chatbot": _health_cache["php_status"],
             "max_audio_size": f"{MAX_AUDIO_SIZE/1024/1024:.1f}MB",
             "min_audio_size": f"{MIN_AUDIO_SIZE/1024:.1f}KB",
@@ -601,7 +579,7 @@ async def root():
     """Root endpoint"""
     return {
         "message": "AgriWatt Voice Bot API",
-        "version": "1.0.2",
+        "version": "1.0.3",
         "platform": "Railway",
         "memory_usage": f"{check_memory_usage()}%",
         "max_audio_size": f"{MAX_AUDIO_SIZE/1024/1024:.1f}MB",
@@ -615,8 +593,8 @@ async def root():
     }
 
 if __name__ == "__main__":
-    print(f"🚀 Starting AgriWatt Voice Server on port {PORT}...")
-    print(f"📏 Audio limits - MIN: {MIN_AUDIO_SIZE/1024:.1f}KB, MAX: {MAX_AUDIO_SIZE/1024/1024:.1f}MB")
+    print(f"Starting AgriWatt Voice Server on port {PORT}...")
+    print(f"Audio limits - MIN: {MIN_AUDIO_SIZE/1024:.1f}KB, MAX: {MAX_AUDIO_SIZE/1024/1024:.1f}MB")
     uvicorn.run(
         app,
         host="0.0.0.0",
