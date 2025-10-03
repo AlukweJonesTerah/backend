@@ -14,6 +14,12 @@ import resource
 # Set seed for consistent language detection
 DetectorFactory.seed = 0
 
+# Configure GRPC for low-resource environments BEFORE importing Google clients
+os.environ["GRPC_ENABLE_FORK_SUPPORT"] = "False"
+os.environ["GRPC_POLL_STRATEGY"] = "poll"
+os.environ["GRPC_MAX_IO_THREADS"] = "2"  # Limit GRPC threads
+os.environ["GRPC_MINIMUM_CHANNELS"] = "1"
+
 # Configure logging for Railway
 logging.basicConfig(
     level=logging.INFO,
@@ -36,10 +42,6 @@ except ImportError:
 if os.getenv("RAILWAY_ENVIRONMENT"):
     logger.info("🚆 Running on Railway - applying optimizations")
     
-    # Reduce memory usage for Railway's free tier
-    os.environ["GRPC_ENABLE_FORK_SUPPORT"] = "False"
-    os.environ["GRPC_POLL_STRATEGY"] = "poll"
-    
     # Set memory limits
     try:
         # 450MB limit to stay safe within 512MB
@@ -50,9 +52,9 @@ if os.getenv("RAILWAY_ENVIRONMENT"):
         logger.warning("Could not set memory limits")
 
 def optimize_thread_pool():
-    """Optimize thread pool for Railway free tier"""
+    """Optimize thread pool for Railway free tier - use single worker"""
     import concurrent.futures
-    return concurrent.futures.ThreadPoolExecutor(max_workers=2)
+    return concurrent.futures.ThreadPoolExecutor(max_workers=1)  # Reduced to 1
 
 # Initialize optimized executor
 executor = optimize_thread_pool()
@@ -110,7 +112,7 @@ app.add_middleware(
 
 # Environment variables
 CHATBOT_URL = os.getenv("CHATBOT_URL", "https://agriwatthub.com/chatbot-api.php")
-MAX_AUDIO_SIZE = int(os.getenv("MAX_AUDIO_SIZE", 5 * 1024 * 1024))  # 5MB limit for Railway
+MAX_AUDIO_SIZE = int(os.getenv("MAX_AUDIO_SIZE", 3 * 1024 * 1024))  # Reduced to 3MB for Railway
 PORT = int(os.getenv("PORT", 8000))
 
 # Initialize Google Cloud clients
@@ -129,8 +131,19 @@ def initialize_google_clients():
             from google.oauth2 import service_account
             credentials = service_account.Credentials.from_service_account_info(credentials_dict)
             
-            speech_client = speech.SpeechClient(credentials=credentials)
-            tts_client = texttospeech.TextToSpeechClient(credentials=credentials)
+            # Create clients with minimal configuration
+            speech_client = speech.SpeechClient(
+                credentials=credentials,
+                client_options={
+                    'api_endpoint': 'speech.googleapis.com',
+                }
+            )
+            tts_client = texttospeech.TextToSpeechClient(
+                credentials=credentials,
+                client_options={
+                    'api_endpoint': 'texttospeech.googleapis.com',
+                }
+            )
             logger.info("✅ Google Cloud clients initialized from environment variable")
             return
         
@@ -196,16 +209,8 @@ async def startup_event():
     # Initialize Google clients
     initialize_google_clients()
     
-    # Pre-warm Google Cloud clients
-    if speech_client:
-        try:
-            # Test speech client (this will warm up the connection)
-            await asyncio.get_event_loop().run_in_executor(
-                executor, 
-                lambda: speech_client.get_operation(name="test")
-            )
-        except Exception as e:
-            logger.info("Google Cloud clients warmed up (expected test failure)")
+    # Skip warm-up to avoid thread creation issues
+    logger.info("Skipping Google Cloud warm-up to conserve threads")
     
     logger.info(f"✅ AgriWatt Voice Bot ready on port {PORT}")
     logger.info(f"✅ Memory usage: {check_memory_usage()}%")
@@ -396,7 +401,8 @@ async def process_audio_to_text(audio_content: bytes, content_type: str = "audio
             logger.warning(f"High memory usage ({memory_usage}%), reducing audio quality")
             audio_content = reduce_audio_quality(audio_content)
         else:
-            audio_content = enhance_audio_quality(audio_content)
+            # Skip enhancement to save resources
+            pass
 
         if len(audio_content) < 1000:
             raise HTTPException(status_code=400, detail="Audio recording too short")
@@ -438,8 +444,8 @@ async def process_audio_to_text(audio_content: bytes, content_type: str = "audio
                 language_code="en-US",
                 alternative_language_codes=["sw-KE", "fr-FR", "es-ES", "pt-PT", "ar-XA", "hi-IN"],
                 enable_automatic_punctuation=True,
-                model="default",
-                use_enhanced=True,
+                model="command_and_search",  # Use lighter model
+                use_enhanced=False,  # Disable enhanced to save resources
                 speech_contexts=[get_speech_context()] 
             )
             
@@ -459,9 +465,10 @@ async def process_audio_to_text(audio_content: bytes, content_type: str = "audio
             
             logger.info(f"Speech-to-Text: '{transcript}' (Confidence: {confidence:.2f})")
             
-            if confidence < 0.5:
+            if confidence < 0.3:  # Lowered threshold
                 logger.warning(f"Low confidence transcription: {confidence}")
-                raise HTTPException(status_code=400, detail="Sauti haikusikika vizuri. Tafadhali ongea wazi zaidi na karibu na kifaa.")
+                # Don't raise error, just return with warning
+                return transcript.strip()
             
             return transcript.strip()
             
@@ -489,7 +496,6 @@ async def call_php_chatbot(message: str, session_id: Optional[str] = None) -> di
         }
 
         logger.info(f"Calling PHP chatbot: {CHATBOT_URL}")
-        logger.info(f"Payload: {payload}")
 
         response = await asyncio.wait_for(
             asyncio.get_event_loop().run_in_executor(
@@ -609,9 +615,15 @@ async def process_voice(
         new_session_id = chatbot_response.get("session_id", session_id)
         success = chatbot_response.get("success", False)
 
-        # Step 3: Text to Speech
+        # Step 3: Text to Speech (optional to save resources)
+        audio_base64 = None
         reply_language = enhanced_language_detection(reply_text)
-        audio_base64 = text_to_speech(reply_text, reply_language)
+        
+        # Only generate TTS if memory usage is low
+        if check_memory_usage() < 70:
+            audio_base64 = text_to_speech(reply_text, reply_language)
+        else:
+            logger.warning("Skipping TTS due to high memory usage")
 
         # Prepare response
         response_data = {
@@ -670,14 +682,10 @@ async def chatbot_endpoint(request_data: ChatbotRequest):
 async def health_check():
     """Health check endpoint"""
     try:
-        # Test PHP chatbot connectivity
-        test_response = await call_php_chatbot("test")
-        php_status = "connected" if test_response.get("success") else "error"
-        
+        # Light health check without calling chatbot
         return {
             "status": "healthy",
             "service": "AgriWatt Voice Bot",
-            "php_chatbot": php_status,
             "google_services": "connected" if speech_client and tts_client else "disconnected",
             "memory_usage": f"{check_memory_usage()}%",
             "timestamp": datetime.now().isoformat()
@@ -686,7 +694,6 @@ async def health_check():
         return {
             "status": "degraded",
             "service": "AgriWatt Voice Bot", 
-            "php_chatbot": "disconnected",
             "error": str(e),
             "timestamp": datetime.now().isoformat()
         }
@@ -729,8 +736,6 @@ async def voice_feedback(request_data: FeedbackRequest):
             'session_id': request_data.session_id,
             'original': request_data.original_transcript,
             'corrected': request_data.corrected_text,
-            'difference': len([i for i in range(min(len(request_data.original_transcript), len(request_data.corrected_text))) 
-                            if request_data.original_transcript[i] != request_data.corrected_text[i]])
         }
         
         feedback_file = 'logs/stt_feedback.json'
@@ -778,37 +783,6 @@ async def metrics():
             })
         
         return metrics_data
-    except Exception as e:
-        return {"error": str(e)}
-
-@app.get("/debug/audio-info")
-async def debug_audio_info(audio: UploadFile = File(...)):
-    """Debug endpoint to get audio file information"""
-    try:
-        audio_content = await audio.read()
-        
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".audio") as temp_file:
-            temp_file.write(audio_content)
-            temp_path = temp_file.name
-        
-        try:
-            audio_segment = AudioSegment.from_file(temp_path)
-            
-            info = {
-                "file_size": len(audio_content),
-                "duration_seconds": len(audio_segment) / 1000.0,
-                "channels": audio_segment.channels,
-                "sample_width": audio_segment.sample_width,
-                "frame_rate": audio_segment.frame_rate,
-                "frame_count": audio_segment.frame_count(),
-                "content_type": audio.content_type
-            }
-            
-            return info
-        finally:
-            if os.path.exists(temp_path):
-                os.unlink(temp_path)
-                
     except Exception as e:
         return {"error": str(e)}
 
