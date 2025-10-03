@@ -71,10 +71,16 @@ class ChatbotRequest(BaseModel):
     message: str
     session_id: Optional[str] = None
 
-# Environment variables
+# Environment variables with better defaults
 CHATBOT_URL = os.getenv("CHATBOT_URL", "https://agriwatthub.com/chatbot-api.php")
-MAX_AUDIO_SIZE = int(os.getenv("MAX_AUDIO_SIZE", 5 * 1024 * 1024))
+MAX_AUDIO_SIZE = int(os.getenv("MAX_AUDIO_SIZE", 10 * 1024 * 1024))  # Default 10MB
+MIN_AUDIO_SIZE = int(os.getenv("MIN_AUDIO_SIZE", 5000))  # Minimum 5KB
 PORT = int(os.getenv("PORT", 8000))
+
+# Log configuration on startup
+logger.info(f"Configuration - MAX_AUDIO_SIZE: {MAX_AUDIO_SIZE} bytes ({MAX_AUDIO_SIZE/1024/1024:.1f}MB)")
+logger.info(f"Configuration - MIN_AUDIO_SIZE: {MIN_AUDIO_SIZE} bytes ({MIN_AUDIO_SIZE/1024:.1f}KB)")
+logger.info(f"Configuration - CHATBOT_URL: {CHATBOT_URL}")
 
 def initialize_google_clients():
     """Lazy initialization of Google Cloud clients"""
@@ -111,7 +117,6 @@ async def lifespan(app: FastAPI):
     logger.info("🚆 Starting AgriWatt Voice Bot on Railway")
     
     # Lazy initialization - only create clients when needed
-    # This avoids creating gRPC threads during startup
     logger.info("⏭️ Deferring Google Cloud client initialization")
     
     # Create httpx session with strict limits
@@ -433,41 +438,64 @@ async def process_voice(
     audio: UploadFile = File(...),
     session_id: Optional[str] = Form(None)
 ):
-    """Main voice processing endpoint"""
+    """Main voice processing endpoint with enhanced logging"""
     try:
+        # Log configuration for debugging
+        logger.info(f"Audio size limits - MIN: {MIN_AUDIO_SIZE} bytes, MAX: {MAX_AUDIO_SIZE} bytes")
+        
         memory_usage = check_memory_usage()
         if memory_usage > 85:
             logger.error(f"Memory overload: {memory_usage}%")
             raise HTTPException(status_code=503, detail="System overloaded")
         
+        # Validate content type
         if not audio.content_type or not audio.content_type.startswith('audio/'):
             logger.error(f"Invalid content type: {audio.content_type}")
-            raise HTTPException(status_code=400, detail="Invalid audio file")
+            raise HTTPException(status_code=400, detail="Invalid audio file - must be audio/* format")
         
+        # Read audio content
         audio_content = await audio.read()
-        logger.info(f"Received audio: {len(audio_content)} bytes, type: {audio.content_type}")
+        audio_size_kb = len(audio_content) / 1024
+        audio_size_mb = audio_size_kb / 1024
+        
+        logger.info(f"📥 Received audio: {len(audio_content)} bytes ({audio_size_kb:.1f}KB / {audio_size_mb:.2f}MB)")
+        logger.info(f"📄 Content type: {audio.content_type}")
+        logger.info(f"📏 Size check: MIN={MIN_AUDIO_SIZE}, ACTUAL={len(audio_content)}, MAX={MAX_AUDIO_SIZE}")
+        
+        # Validate size constraints
+        if len(audio_content) < MIN_AUDIO_SIZE:
+            logger.error(f"❌ Audio too short: {len(audio_content)} bytes (min: {MIN_AUDIO_SIZE})")
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Audio too short ({audio_size_kb:.1f}KB) - please speak for at least 3 seconds"
+            )
         
         if len(audio_content) > MAX_AUDIO_SIZE:
-            logger.error(f"Audio too large: {len(audio_content)} bytes")
-            raise HTTPException(status_code=400, detail="Audio file too large")
+            logger.error(f"❌ Audio too large: {len(audio_content)} bytes (max: {MAX_AUDIO_SIZE})")
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Audio too large ({audio_size_mb:.1f}MB) - maximum is {MAX_AUDIO_SIZE/1024/1024:.1f}MB"
+            )
         
-        if len(audio_content) < 1000:
-            logger.error(f"Audio too short: {len(audio_content)} bytes")
-            raise HTTPException(status_code=400, detail="Audio too short - speak for at least 3 seconds")
+        logger.info("✅ Audio size validation passed")
 
         # Speech to Text
-        logger.info("Starting speech-to-text processing...")
+        logger.info("🎤 Starting speech-to-text processing...")
         transcript = await process_audio_to_text(audio_content, audio.content_type)
-        logger.info(f"Transcript: {transcript}")
+        logger.info(f"📝 Transcript received: '{transcript}'")
 
         # Call PHP Chatbot
+        logger.info("🤖 Calling PHP chatbot...")
         chatbot_response = await call_php_chatbot(transcript, session_id)
         
         reply_text = chatbot_response.get("reply", "Samahani, sijapata jibu.")
         new_session_id = chatbot_response.get("session_id", session_id)
         success = chatbot_response.get("success", False)
+        
+        logger.info(f"💬 Chatbot response received (success: {success})")
 
         # Text to Speech
+        logger.info("🔊 Generating audio response...")
         reply_language = enhanced_language_detection(reply_text)
         audio_base64 = text_to_speech(reply_text, reply_language)
 
@@ -481,14 +509,18 @@ async def process_voice(
         
         if audio_base64:
             response_data["audio"] = audio_base64
+            logger.info("✅ Audio response generated successfully")
+        else:
+            logger.warning("⚠️ No audio response generated")
 
+        logger.info("✅ Voice processing completed successfully")
         return JSONResponse(response_data)
 
     except HTTPException as e:
-        logger.error(f"HTTP Exception: {e.status_code} - {e.detail}")
+        logger.error(f"❌ HTTP Exception: {e.status_code} - {e.detail}")
         raise
     except Exception as e:
-        logger.error(f"Voice processing error: {type(e).__name__} - {str(e)}", exc_info=True)
+        logger.error(f"❌ Unexpected error: {type(e).__name__} - {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
 
 @app.post("/api/chatbot")
@@ -552,6 +584,8 @@ async def health_check():
             "memory_usage": f"{memory.percent}%",
             "google_cloud": google_status,
             "php_chatbot": _health_cache["php_status"],
+            "max_audio_size": f"{MAX_AUDIO_SIZE/1024/1024:.1f}MB",
+            "min_audio_size": f"{MIN_AUDIO_SIZE/1024:.1f}KB",
             "timestamp": datetime.now().isoformat()
         }
         
@@ -567,9 +601,11 @@ async def root():
     """Root endpoint"""
     return {
         "message": "AgriWatt Voice Bot API",
-        "version": "1.0.1",
+        "version": "1.0.2",
         "platform": "Railway",
         "memory_usage": f"{check_memory_usage()}%",
+        "max_audio_size": f"{MAX_AUDIO_SIZE/1024/1024:.1f}MB",
+        "min_audio_size": f"{MIN_AUDIO_SIZE/1024:.1f}KB",
         "endpoints": {
             "voice": "/api/voice (POST)",
             "chatbot": "/api/chatbot (POST)", 
@@ -580,6 +616,7 @@ async def root():
 
 if __name__ == "__main__":
     print(f"🚀 Starting AgriWatt Voice Server on port {PORT}...")
+    print(f"📏 Audio limits - MIN: {MIN_AUDIO_SIZE/1024:.1f}KB, MAX: {MAX_AUDIO_SIZE/1024/1024:.1f}MB")
     uvicorn.run(
         app,
         host="0.0.0.0",
