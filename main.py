@@ -433,6 +433,7 @@ async def text_to_speech(text: str, language_code: str) -> Optional[str]:
         logger.error(f"TTS failed: {e}")
         return None
 
+
 @app.post("/api/voice")
 async def process_voice(
     audio: UploadFile = File(...),
@@ -475,20 +476,38 @@ async def process_voice(
         transcript = await process_audio_to_text(audio_content, audio.content_type)
         logger.info(f"Transcript: '{transcript}'")
 
-        # Call PHP Chatbot
+        # Call PHP Chatbot with timeout handling
         logger.info("Calling chatbot...")
-        chatbot_response = await call_php_chatbot(transcript, session_id)
-        
+        try:
+            chatbot_response = await asyncio.wait_for(
+                call_php_chatbot(transcript, session_id), 
+                timeout=10.0  # 10 second timeout for PHP call
+            )
+        except asyncio.TimeoutError:
+            logger.error("PHP chatbot call timed out")
+            chatbot_response = {
+                "success": False, 
+                "reply": "I'm experiencing high load. Please try again in a moment.",
+                "session_id": session_id
+            }
+
         reply_text = chatbot_response.get("reply", "No response available.")
         new_session_id = chatbot_response.get("session_id", session_id)
         success = chatbot_response.get("success", False)
         
         logger.info(f"Chatbot response received (success: {success})")
 
-        # Text to Speech
+        # Text to Speech with timeout
         logger.info("Generating audio response...")
-        reply_language = enhanced_language_detection(reply_text)
-        audio_base64 = await text_to_speech(reply_text, reply_language)
+        try:
+            reply_language = enhanced_language_detection(reply_text)
+            audio_base64 = await asyncio.wait_for(
+                text_to_speech(reply_text, reply_language),
+                timeout=8.0  # 8 second timeout for TTS
+            )
+        except asyncio.TimeoutError:
+            logger.warning("TTS timed out, continuing without audio")
+            audio_base64 = None
 
         response_data = {
             "success": success,
@@ -508,9 +527,13 @@ async def process_voice(
     except HTTPException as e:
         logger.error(f"HTTP Exception: {e.status_code} - {e.detail}")
         raise
+    except asyncio.TimeoutError:
+        logger.error("Overall voice processing timeout")
+        raise HTTPException(status_code=504, detail="Processing timeout")
     except Exception as e:
         logger.error(f"Unexpected error: {type(e).__name__} - {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
+    
 
 @app.post("/api/chatbot")
 async def chatbot_endpoint(request_data: ChatbotRequest):
