@@ -10,7 +10,6 @@ from pydub import AudioSegment
 from datetime import datetime
 import json
 import psutil
-import aiohttp
 import httpx
 
 # Safe import for Linux-only resource module
@@ -19,8 +18,8 @@ try:
 except ImportError:
     resource = None
 
-# --- Global aiohttp session ---
-session: aiohttp.ClientSession = None
+# --- Global httpx session ---
+http_session = None # type: Optional[httpx.AsyncClient]
 
 # Set seed for consistent language detection
 DetectorFactory.seed = 0
@@ -89,8 +88,8 @@ def initialize_google_clients():
             from google.oauth2 import service_account
             creds_json = base64.b64decode(creds_base64).decode('utf-8')
             credentials = service_account.Credentials.from_service_account_info(
-            json.loads(creds_json)
-        )
+                json.loads(creds_json)
+            )
         speech_client = speech.SpeechClient(credentials=credentials)
         tts_client = texttospeech.TextToSpeechClient(credentials=credentials)
         logger.info("✅ Google Cloud clients initialized from environment variable")
@@ -145,36 +144,27 @@ async def call_php_chatbot(message: str, session_id: Optional[str] = None) -> di
             'User-Agent': 'AgriWatt-Voice-Bot/1.0'
         }
 
-        if not session:
-            timeout = aiohttp.ClientTimeout(total=30)
-            session = aiohttp.ClientSession(timeout=timeout)
-            logger.warning("⚠️ Created new aiohttp session (startup might have failed)")
+        if not http_session:
+            http_session = httpx.AsyncClient(timeout=30)
+            logger.warning("⚠️ Created new httpx session (startup might have failed)")
 
         logger.info(f"Calling PHP chatbot: {CHATBOT_URL}")
 
-        async with session.post(CHATBOT_URL, json=payload, headers=headers) as response:
-            logger.info(f"PHP chatbot response status: {response.status}")
+        response = await http_session.post(CHATBOT_URL, json=payload, headers=headers)
+        logger.info(f"PHP chatbot response status: {response.status_code}")
 
-            if response.status != 200:
-                return {"success": False, "reply": "Samahani, mfumo wa mazungumzo unakabiliwa na shida."}
+        if response.status_code != 200:
+            return {"success": False, "reply": "Samahani, mfumo wa mazungumzo unakabiliwa na shida."}
 
-            response_data = await response.json()
-            if not isinstance(response_data, dict):
-                return {"success": False, "reply": "Samahani, jibu lisilotarajiwa."}
+        response_data = response.json()
+        if not isinstance(response_data, dict):
+            return {"success": False, "reply": "Samahani, jibu lisilotarajiwa."}
 
-            response_data.setdefault("success", True)
-            response_data.setdefault("reply", "Samahani, hakuna jibu.")
-            return response_data
+        response_data.setdefault("success", True)
+        response_data.setdefault("reply", "Samahani, hakuna jibu.")
+        return response_data
 
-    except asyncio.TimeoutError:
-        return {"success": False, "reply": "Samahani, mfumo umechelewa."}
-    except Exception as e:
-        logger.error(f"Unexpected error calling PHP chatbot: {e}")
-        return {"success": False, "reply": "Samahani, kuna hitilafu isiyotarajiwa."}
-
-                
-    except asyncio.TimeoutError:
-        logger.error("PHP chatbot request timed out")
+    except httpx.TimeoutException:
         return {"success": False, "reply": "Samahani, mfumo umechelewa."}
     except Exception as e:
         logger.error(f"Unexpected error calling PHP chatbot: {e}")
