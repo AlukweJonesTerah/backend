@@ -1,0 +1,9 @@
+[service]
+http.port = 8000
+
+[deploy]
+numReplicas = 1  # Force single instance
+
+[variables]
+WEB_CONCURRENCY = "1"  # Force single worker
+MAX_WORKERS = "1"

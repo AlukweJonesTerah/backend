@@ -1,8 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from google.cloud import speech, texttospeech
-from langdetect import detect, DetectorFactory
 from pydantic import BaseModel
 import tempfile, os, requests, base64, logging, asyncio, uvicorn
 from typing import Optional
@@ -12,13 +10,15 @@ import json
 import resource
 
 # Set seed for consistent language detection
+from langdetect import detect, DetectorFactory
 DetectorFactory.seed = 0
 
 # Configure GRPC for low-resource environments BEFORE importing Google clients
 os.environ["GRPC_ENABLE_FORK_SUPPORT"] = "False"
 os.environ["GRPC_POLL_STRATEGY"] = "poll"
-os.environ["GRPC_MAX_IO_THREADS"] = "2"  # Limit GRPC threads
+os.environ["GRPC_MAX_IO_THREADS"] = "1"  # Further reduced to 1 thread
 os.environ["GRPC_MINIMUM_CHANNELS"] = "1"
+os.environ["GRPC_DNS_MIN_TIME_BETWEEN_RESOLUTIONS_MS"] = "30000"  # Reduce DNS lookups
 
 # Configure logging for Railway
 logging.basicConfig(
@@ -54,7 +54,7 @@ if os.getenv("RAILWAY_ENVIRONMENT"):
 def optimize_thread_pool():
     """Optimize thread pool for Railway free tier - use single worker"""
     import concurrent.futures
-    return concurrent.futures.ThreadPoolExecutor(max_workers=1)  # Reduced to 1
+    return concurrent.futures.ThreadPoolExecutor(max_workers=1)  # Single worker
 
 # Initialize optimized executor
 executor = optimize_thread_pool()
@@ -74,12 +74,10 @@ def check_memory_usage():
         except Exception as e:
             logger.warning(f"Memory check failed: {e}")
     
-    # Fallback: check using resource module (Unix only)
+    # Simple memory check using resource module
     try:
         usage = resource.getrusage(resource.RUSAGE_SELF)
-        # This gives memory in KB, convert to percentage is tricky without total
-        memory_mb = usage.ru_maxrss / 1024  # Convert to MB
-        # Rough estimate: assume 512MB total on Railway
+        memory_mb = usage.ru_maxrss / 1024
         estimated_percent = (memory_mb / 512) * 100
         return min(estimated_percent, 100)
     except:
@@ -112,61 +110,62 @@ app.add_middleware(
 
 # Environment variables
 CHATBOT_URL = os.getenv("CHATBOT_URL", "https://agriwatthub.com/chatbot-api.php")
-MAX_AUDIO_SIZE = int(os.getenv("MAX_AUDIO_SIZE", 3 * 1024 * 1024))  # Reduced to 3MB for Railway
+MAX_AUDIO_SIZE = int(os.getenv("MAX_AUDIO_SIZE", 2 * 1024 * 1024))  # Reduced to 2MB for Railway
 PORT = int(os.getenv("PORT", 8000))
 
-# Initialize Google Cloud clients
+# Initialize Google Cloud clients as None - will be initialized on first use
 speech_client = None
 tts_client = None
+clients_initialized = False
+clients_lock = asyncio.Lock()
 
-def initialize_google_clients():
-    global speech_client, tts_client
-    try:
-        # Method 1: Base64 encoded credentials (Recommended for Railway)
-        creds_base64 = os.getenv("GOOGLE_CREDENTIALS_BASE64")
-        if creds_base64:
-            creds_json = base64.b64decode(creds_base64).decode('utf-8')
-            credentials_dict = json.loads(creds_json)
-            
-            from google.oauth2 import service_account
-            credentials = service_account.Credentials.from_service_account_info(credentials_dict)
-            
-            # Create clients with minimal configuration
-            speech_client = speech.SpeechClient(
-                credentials=credentials,
-                client_options={
-                    'api_endpoint': 'speech.googleapis.com',
-                }
-            )
-            tts_client = texttospeech.TextToSpeechClient(
-                credentials=credentials,
-                client_options={
-                    'api_endpoint': 'texttospeech.googleapis.com',
-                }
-            )
-            logger.info("✅ Google Cloud clients initialized from environment variable")
-            return
-        
-        # Method 2: JSON file path
-        creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-        if creds_path and os.path.exists(creds_path):
-            speech_client = speech.SpeechClient.from_service_account_file(creds_path)
-            tts_client = texttospeech.TextToSpeechClient.from_service_account_file(creds_path)
-            logger.info("✅ Google Cloud clients initialized from file path")
+async def initialize_google_clients():
+    """Initialize Google Cloud clients on first use with thread safety"""
+    global speech_client, tts_client, clients_initialized
+    
+    async with clients_lock:
+        if clients_initialized:
             return
             
-        # Method 3: Default local file for development
-        default_path = "./google-credentials.json"
-        if os.path.exists(default_path):
-            speech_client = speech.SpeechClient.from_service_account_file(default_path)
-            tts_client = texttospeech.TextToSpeechClient.from_service_account_file(default_path)
-            logger.info("✅ Google Cloud clients initialized from local file")
-            return
+        try:
+            # Method 1: Base64 encoded credentials (Recommended for Railway)
+            creds_base64 = os.getenv("GOOGLE_CREDENTIALS_BASE64")
+            if creds_base64:
+                creds_json = base64.b64decode(creds_base64).decode('utf-8')
+                credentials_dict = json.loads(creds_json)
+                
+                from google.oauth2 import service_account
+                from google.cloud import speech, texttospeech
+                
+                credentials = service_account.Credentials.from_service_account_info(credentials_dict)
+                
+                # Create clients with minimal configuration
+                speech_client = speech.SpeechClient(
+                    credentials=credentials,
+                    client_options={
+                        'api_endpoint': 'speech.googleapis.com',
+                    }
+                )
+                tts_client = texttospeech.TextToSpeechClient(
+                    credentials=credentials,
+                    client_options={
+                        'api_endpoint': 'texttospeech.googleapis.com',
+                    }
+                )
+                logger.info("✅ Google Cloud clients initialized from environment variable")
+                clients_initialized = True
+                return
             
-        logger.error("❌ No Google Cloud credentials found")
-        
-    except Exception as e:
-        logger.error(f"❌ Failed to initialize Google Cloud clients: {e}")
+            logger.error("❌ No Google Cloud credentials found")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize Google Cloud clients: {e}")
+
+async def ensure_google_clients():
+    """Ensure Google clients are initialized before use"""
+    if not clients_initialized:
+        await initialize_google_clients()
+    return speech_client is not None and tts_client is not None
 
 def reduce_audio_quality(audio_content: bytes) -> bytes:
     """Reduce audio quality to save memory on Railway"""
@@ -206,11 +205,8 @@ async def startup_event():
     """Startup optimization for Railway"""
     logger.info("🚆 Starting AgriWatt Voice Bot on Railway")
     
-    # Initialize Google clients
-    initialize_google_clients()
-    
-    # Skip warm-up to avoid thread creation issues
-    logger.info("Skipping Google Cloud warm-up to conserve threads")
+    # Don't initialize Google clients at startup - do it on first use
+    logger.info("Google Cloud clients will be initialized on first use")
     
     logger.info(f"✅ AgriWatt Voice Bot ready on port {PORT}")
     logger.info(f"✅ Memory usage: {check_memory_usage()}%")
@@ -226,9 +222,6 @@ def enhanced_language_detection(text: str) -> str:
             'sw': ['shamba', 'mazao', 'umwagiliaji', 'mvua', 'udongo', 'kilimo'],
             'fr': ['ferme', 'culture', 'irrigation', 'récolte', 'sol', 'agriculture'],
             'es': ['granja', 'cultivo', 'riego', 'cosecha', 'suelo', 'agricultura'],
-            'pt': ['fazenda', 'cultivo', 'irrigação', 'colheita', 'solo', 'agricultura'],
-            'ar': ['مزرعة', 'محصول', 'ري', 'حصاد', 'تربة', 'زراعة'],
-            'hi': ['खेत', 'फसल', 'सिंचाई', 'फसल कटाई', 'मिट्टी', 'कृषि']
         }
         
         text_lower = text.lower()
@@ -249,9 +242,6 @@ def enhanced_language_detection(text: str) -> str:
             'sw': ['jambo', 'asante', 'sana', 'habari', 'pole', 'shamba', 'mazao', 'mkulima'],
             'fr': ['bonjour', 'merci', 'agriculture', 'ferme', 'cultiver', 'plante'],
             'es': ['hola', 'gracias', 'agricultura', 'granja', 'cultivar', 'planta'],
-            'pt': ['olá', 'obrigado', 'agricultura', 'fazenda', 'cultivar', 'planta'],
-            'ar': ['مرحبا', 'شكرا', 'زراعة', 'مزرعة', 'يزرع', 'نبات'],
-            'hi': ['नमस्ते', 'धन्यवाद', 'कृषि', 'खेत', 'उगाना', 'पौधा'],
             'en': ['hello', 'thanks', 'farming', 'agriculture', 'crop', 'plant']
         }
         
@@ -302,12 +292,13 @@ def convert_audio_format(audio_content: bytes, target_format: str = "wav") -> by
 
 def get_speech_context():
     """Provide domain-specific phrases to improve STT accuracy"""
+    from google.cloud import speech
     return speech.SpeechContext(phrases=[
-        "agriwatt", "agriwatt hub", "agriculture", "farming", "kenya",
-        "crops", "irrigation", "solar", "technology", "farm",
-        "precipitation", "weather", "soil", "crop", "livestock",
-        "maize", "coffee", "tea", "dairy", "horticulture",
-        "smart farming", "precision agriculture", "climate", "water", "fertilizer"
+        "agriwatt", "agriculture", "farming", "kenya",
+        "crops", "irrigation", "solar", "farm",
+        "weather", "soil", "crop", "livestock",
+        "maize", "coffee", "tea", "dairy",
+        "smart farming", "climate", "water", "fertilizer"
     ])
 
 def correct_domain_terms(transcript: str) -> str:
@@ -318,11 +309,6 @@ def correct_domain_terms(transcript: str) -> str:
         "agriculture what": "agriwatt",
         "agri what": "agriwatt",
         "a agree": "agri",
-        "precipitation": "precipitation",
-        "irrigation": "irrigation",
-        "horticulture": "horticulture",
-        "maize": "maize",
-        "fertilizer": "fertilizer"
     }
     
     transcript_lower = transcript.lower()
@@ -337,62 +323,23 @@ def get_voice_config(language_code: str) -> tuple:
     """
     Get appropriate voice configuration for multiple languages
     """
+    from google.cloud import texttospeech
+    
     voice_map = {
         'en': ('en-US-Wavenet-F', texttospeech.SsmlVoiceGender.FEMALE, 'en-US'),
         'sw': ('en-US-Wavenet-D', texttospeech.SsmlVoiceGender.MALE, 'en-US'),
         'fr': ('fr-FR-Wavenet-A', texttospeech.SsmlVoiceGender.FEMALE, 'fr-FR'),
         'es': ('es-ES-Wavenet-B', texttospeech.SsmlVoiceGender.MALE, 'es-ES'),
-        'pt': ('pt-PT-Wavenet-C', texttospeech.SsmlVoiceGender.FEMALE, 'pt-PT'),
-        'ar': ('ar-XA-Wavenet-A', texttospeech.SsmlVoiceGender.FEMALE, 'ar-XA'),
-        'hi': ('hi-IN-Wavenet-A', texttospeech.SsmlVoiceGender.FEMALE, 'hi-IN')
     }
     
     voice_config = voice_map.get(language_code, voice_map['en'])
     return voice_config[0], voice_config[1], voice_config[2]
 
-def enhance_audio_quality(audio_content: bytes) -> bytes:
-    """Enhance audio quality for better STT accuracy"""
-    try:
-        # Check memory before processing
-        memory_usage = check_memory_usage()
-        if memory_usage > 75:
-            logger.warning(f"Memory usage high ({memory_usage}%), skipping audio enhancement")
-            return audio_content
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_in:
-            temp_in.write(audio_content)
-            temp_in_path = temp_in.name
-        
-        audio = AudioSegment.from_file(temp_in_path)
-        
-        # Light enhancements for Railway
-        audio = audio.high_pass_filter(80)  # Remove low-frequency noise
-        audio = audio.normalize()  # Normalize volume
-        
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_out:
-            audio.export(temp_out.name, format="wav", parameters=[
-                "-ac", "1", 
-                "-ar", "16000",
-                "-acodec", "pcm_s16le"
-            ])
-            
-            with open(temp_out.name, "rb") as f:
-                enhanced_audio = f.read()
-        
-        for path in [temp_in_path, temp_out.name]:
-            if os.path.exists(path):
-                os.unlink(path)
-                
-        return enhanced_audio
-        
-    except Exception as e:
-        logger.warning(f"Audio enhancement failed: {e}")
-        return audio_content
-
 async def process_audio_to_text(audio_content: bytes, content_type: str = "audio/webm") -> str:
     """Convert audio to text with better format handling"""
     try:
-        if speech_client is None:
+        # Ensure clients are initialized
+        if not await ensure_google_clients():
             raise HTTPException(status_code=503, detail="Speech service temporarily unavailable")
         
         # Memory check
@@ -400,9 +347,6 @@ async def process_audio_to_text(audio_content: bytes, content_type: str = "audio
         if memory_usage > 80:
             logger.warning(f"High memory usage ({memory_usage}%), reducing audio quality")
             audio_content = reduce_audio_quality(audio_content)
-        else:
-            # Skip enhancement to save resources
-            pass
 
         if len(audio_content) < 1000:
             raise HTTPException(status_code=400, detail="Audio recording too short")
@@ -411,8 +355,6 @@ async def process_audio_to_text(audio_content: bytes, content_type: str = "audio
             'audio/webm': 'webm',
             'audio/wav': 'wav', 
             'audio/mpeg': 'mp3',
-            'audio/mp4': 'mp4',
-            'audio/ogg': 'ogg'
         }
         
         file_ext = format_map.get(content_type, 'webm')
@@ -426,6 +368,8 @@ async def process_audio_to_text(audio_content: bytes, content_type: str = "audio
                 audio_content = convert_audio_format(audio_content, "wav")
                 content_type = 'audio/wav'
                 file_ext = 'wav'
+            
+            from google.cloud import speech
             
             encoding_map = {
                 'webm': speech.RecognitionConfig.AudioEncoding.WEBM_OPUS,
@@ -442,7 +386,7 @@ async def process_audio_to_text(audio_content: bytes, content_type: str = "audio
                 sample_rate_hertz=16000,
                 audio_channel_count=1,
                 language_code="en-US",
-                alternative_language_codes=["sw-KE", "fr-FR", "es-ES", "pt-PT", "ar-XA", "hi-IN"],
+                alternative_language_codes=["sw-KE", "fr-FR", "es-ES"],
                 enable_automatic_punctuation=True,
                 model="command_and_search",  # Use lighter model
                 use_enhanced=False,  # Disable enhanced to save resources
@@ -467,8 +411,6 @@ async def process_audio_to_text(audio_content: bytes, content_type: str = "audio
             
             if confidence < 0.3:  # Lowered threshold
                 logger.warning(f"Low confidence transcription: {confidence}")
-                # Don't raise error, just return with warning
-                return transcript.strip()
             
             return transcript.strip()
             
@@ -520,16 +462,19 @@ async def call_php_chatbot(message: str, session_id: Optional[str] = None) -> di
         logger.error(f"Unexpected error calling PHP chatbot: {e}")
         return {"success": False, "reply": "Samahani, kuna hitilafu. Jaribu tena."}
 
-def text_to_speech(text: str, language_code: str) -> Optional[str]:
+async def text_to_speech(text: str, language_code: str) -> Optional[str]:
     """Convert text to speech with multilingual support"""
     try:
-        if tts_client is None:
+        # Ensure clients are initialized
+        if not await ensure_google_clients():
             logger.error("TTS client not initialized")
             return None
             
         if not text or not text.strip():
             return None
             
+        from google.cloud import texttospeech
+        
         synthesis_input = texttospeech.SynthesisInput(text=text)
         voice_name, voice_gender, tts_language = get_voice_config(language_code)
         
@@ -545,10 +490,13 @@ def text_to_speech(text: str, language_code: str) -> Optional[str]:
             pitch=0.0
         )
 
-        response = tts_client.synthesize_speech(
-            input=synthesis_input,
-            voice=voice,
-            audio_config=audio_config
+        response = await asyncio.get_event_loop().run_in_executor(
+            executor,
+            lambda: tts_client.synthesize_speech(
+                input=synthesis_input,
+                voice=voice,
+                audio_config=audio_config
+            )
         )
 
         audio_base64 = base64.b64encode(response.audio_content).decode('utf-8')
@@ -574,7 +522,7 @@ async def process_voice(
                 detail="Mfumo umejaa kwa sasa. Tafadhali jaribu tena baada ya dakika chache."
             )
         
-        if speech_client is None or tts_client is None:
+        if not await ensure_google_clients():
             raise HTTPException(
                 status_code=503, 
                 detail="Huduma ya sauti haipatikani kwa sasa. Tafadhali jaribu tena baadaye."
@@ -619,11 +567,11 @@ async def process_voice(
         audio_base64 = None
         reply_language = enhanced_language_detection(reply_text)
         
-        # Only generate TTS if memory usage is low
-        if check_memory_usage() < 70:
-            audio_base64 = text_to_speech(reply_text, reply_language)
+        # Only generate TTS if memory usage is low and text is not too long
+        if check_memory_usage() < 70 and len(reply_text) < 500:
+            audio_base64 = await text_to_speech(reply_text, reply_language)
         else:
-            logger.warning("Skipping TTS due to high memory usage")
+            logger.warning("Skipping TTS due to high memory usage or long text")
 
         # Prepare response
         response_data = {
@@ -683,10 +631,12 @@ async def health_check():
     """Health check endpoint"""
     try:
         # Light health check without calling chatbot
+        clients_ready = await ensure_google_clients()
+        
         return {
-            "status": "healthy",
+            "status": "healthy" if clients_ready else "degraded",
             "service": "AgriWatt Voice Bot",
-            "google_services": "connected" if speech_client and tts_client else "disconnected",
+            "google_services": "connected" if clients_ready else "disconnected",
             "memory_usage": f"{check_memory_usage()}%",
             "timestamp": datetime.now().isoformat()
         }
@@ -701,14 +651,14 @@ async def health_check():
 @app.get("/")
 async def root():
     """Root endpoint with API information"""
-    google_status = "connected" if speech_client and tts_client else "disconnected"
+    clients_ready = await ensure_google_clients()
     memory_usage = check_memory_usage()
     
     return {
         "message": "AgriWatt Voice Bot API",
         "version": "1.0.0",
         "description": "Voice interface for AgriWatt Hub chatbot",
-        "status": google_status,
+        "status": "connected" if clients_ready else "disconnected",
         "platform": "Railway",
         "memory_usage": f"{memory_usage}%",
         "endpoints": {
@@ -756,45 +706,29 @@ async def metrics():
         
         metrics_data = {
             "memory_usage_percent": memory_usage,
-            "google_clients": "initialized" if speech_client and tts_client else "not_initialized",
+            "google_clients": "initialized" if clients_initialized else "not_initialized",
             "timestamp": datetime.now().isoformat()
         }
-        
-        # Add psutil metrics if available
-        if PSUTIL_AVAILABLE:
-            memory = psutil.virtual_memory()
-            disk = psutil.disk_usage('/')
-            cpu = psutil.cpu_percent(interval=0.1)
-            
-            metrics_data.update({
-                "memory": {
-                    "total": memory.total,
-                    "available": memory.available,
-                    "percent": memory.percent,
-                    "used": memory.used
-                },
-                "disk": {
-                    "total": disk.total,
-                    "used": disk.used,
-                    "free": disk.free,
-                    "percent": disk.percent
-                },
-                "cpu": cpu
-            })
         
         return metrics_data
     except Exception as e:
         return {"error": str(e)}
 
+# Add a simple text-to-speech endpoint that doesn't use Google TTS
+@app.post("/api/simple-tts")
+async def simple_tts_endpoint(request_data: ChatbotRequest):
+    """Simple TTS endpoint that returns text only (no audio)"""
+    return {
+        "success": True,
+        "reply": request_data.message,
+        "session_id": request_data.session_id,
+        "warning": "Audio generation disabled to conserve resources"
+    }
+
 if __name__ == "__main__":
-    # Initialize for local development
-    initialize_google_clients()
-    
+    # For local development only
     if is_port_in_use(PORT):
         print(f"⚠️  Port {PORT} is already in use!")
-        print("💡 Try these solutions:")
-        print(f"   1. Kill existing process: sudo lsof -t -i:{PORT} | xargs kill -9")
-        print(f"   2. Use different port: PORT=8001 python main.py")
         exit(1)
     
     print(f"🚀 Starting AgriWatt Voice Server on port {PORT}...")
