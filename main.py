@@ -794,3 +794,4 @@ if __name__ == "__main__":
     
     print(f"🚀 Starting AgriWatt Voice Server on port {PORT}...")
     uvicorn.run(app, host="0.0.0.0", port=PORT, reload=False)
+
