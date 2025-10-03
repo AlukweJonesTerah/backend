@@ -1,9 +1,13 @@
-[service]
-http.port = 8000
+[build]
+builder = "nixpacks"
 
 [deploy]
-numReplicas = 1  # Force single instance
+numReplicas = 1
+startCommand = "gunicorn -w 1 -k uvicorn.workers.UvicornWorker main:app --bind 0.0.0.0:$PORT --timeout 120 --preload"
 
 [variables]
-WEB_CONCURRENCY = "1"  # Force single worker
+WEB_CONCURRENCY = "1"
 MAX_WORKERS = "1"
+GRPC_ENABLE_FORK_SUPPORT = "False"
+GRPC_POLL_STRATEGY = "poll"
+GRPC_MAX_IO_THREADS = "1"
