@@ -1,10 +1,11 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Request
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from google.cloud import speech, texttospeech
 from langdetect import detect, DetectorFactory
 from pydantic import BaseModel
-import tempfile, os, requests, base64, logging, asyncio, uvicorn
+from contextlib import asynccontextmanager
+import tempfile, os, base64, logging, asyncio, uvicorn
 from typing import Optional
 from pydub import AudioSegment
 from datetime import datetime
@@ -18,63 +19,123 @@ try:
 except ImportError:
     resource = None
 
-# --- Global httpx session ---
-http_session = None # type: Optional[httpx.AsyncClient]
-
-# Global health cache to avoid excessive PHP chatbot calls
-_health_cache = {
-    "last_check": None,
-    "php_status": "unknown",
-    "php_error": None
-}
-HEALTH_CACHE_SECONDS = 60  # Cache health check for 60 seconds
-
 # Set seed for consistent language detection
 DetectorFactory.seed = 0
 
-# Configure logging for Railway
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),  # Railway captures stdout
-    ]
+    handlers=[logging.StreamHandler()],
 )
 logger = logging.getLogger(__name__)
 
-# Railway-specific optimizations
+# Railway-specific optimizations - MUST BE SET BEFORE IMPORTING GOOGLE CLOUD
 if os.getenv("RAILWAY_ENVIRONMENT"):
     logger.info("🚆 Running on Railway - applying optimizations")
-
-    # CRITICAL: Prevent gRPC from creating threads
+    
+    # CRITICAL: Set these BEFORE importing Google Cloud libraries
     os.environ["GRPC_ENABLE_FORK_SUPPORT"] = "0"
     os.environ["GRPC_POLL_STRATEGY"] = "poll"
     os.environ["GRPC_VERBOSITY"] = "ERROR"
     os.environ["GRPC_TRACE"] = ""
-    # Minimal thread pool
     os.environ["GRPC_THREADS"] = "1"
+    os.environ["GRPC_DNS_RESOLVER"] = "native"
     
     if resource:
         try:
-            # Set soft limit for threads (Railway free tier)
-            resource.setrlimit(resource.RLIMIT_NPROC, (50, 100))
-            # 450MB memory limit to stay safe within 512MB
+            # Thread limit for Railway free tier
+            resource.setrlimit(resource.RLIMIT_NPROC, (40, 80))
+            # Memory limit
             memory_limit = 450 * 1024 * 1024
             resource.setrlimit(resource.RLIMIT_AS, (memory_limit, memory_limit))
             logger.info("Memory and thread limits set for Railway free tier")
         except Exception as e:
             logger.warning(f"Could not set resource limits: {e}")
 
+# Global variables
+http_session: Optional[httpx.AsyncClient] = None
+speech_client = None
+tts_client = None
+
+# Health check cache
+_health_cache = {
+    "last_check": None,
+    "php_status": "unknown",
+    "php_error": None
+}
+HEALTH_CACHE_SECONDS = 60
+
 # Pydantic models
 class ChatbotRequest(BaseModel):
     message: str
     session_id: Optional[str] = None
 
+# Environment variables
+CHATBOT_URL = os.getenv("CHATBOT_URL", "https://agriwatthub.com/chatbot-api.php")
+MAX_AUDIO_SIZE = int(os.getenv("MAX_AUDIO_SIZE", 5 * 1024 * 1024))
+PORT = int(os.getenv("PORT", 8000))
+
+def initialize_google_clients():
+    """Lazy initialization of Google Cloud clients"""
+    global speech_client, tts_client
+    
+    if speech_client is not None and tts_client is not None:
+        return  # Already initialized
+    
+    try:
+        creds_base64 = os.getenv("GOOGLE_CREDENTIALS_BASE64")
+        if not creds_base64:
+            logger.error("GOOGLE_CREDENTIALS_BASE64 not set")
+            return
+            
+        from google.oauth2 import service_account
+        creds_json = base64.b64decode(creds_base64).decode('utf-8')
+        credentials = service_account.Credentials.from_service_account_info(
+            json.loads(creds_json)
+        )
+        
+        # Initialize with minimal gRPC channels
+        speech_client = speech.SpeechClient(credentials=credentials)
+        tts_client = texttospeech.TextToSpeechClient(credentials=credentials)
+        logger.info("✅ Google Cloud clients initialized")
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize Google Cloud clients: {e}")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Modern FastAPI lifespan handler"""
+    global http_session
+    
+    logger.info("🚆 Starting AgriWatt Voice Bot on Railway")
+    
+    # Lazy initialization - only create clients when needed
+    # This avoids creating gRPC threads during startup
+    logger.info("⏭️ Deferring Google Cloud client initialization")
+    
+    # Create httpx session with strict limits
+    http_session = httpx.AsyncClient(
+        timeout=30,
+        limits=httpx.Limits(max_connections=3, max_keepalive_connections=1)
+    )
+    logger.info("✅ Global httpx session created")
+    logger.info(f"✅ AgriWatt Voice Bot ready on port {PORT}")
+    
+    yield  # Application runs here
+    
+    # Cleanup
+    if http_session:
+        await http_session.aclose()
+        logger.info("🛑 httpx session closed")
+
+# Create FastAPI app with lifespan
 app = FastAPI(
     title="AgriWatt Voice Bot API", 
     version="1.0.0",
     docs_url="/docs",
-    redoc_url="/redoc"
+    redoc_url="/redoc",
+    lifespan=lifespan
 )
 
 app.add_middleware(
@@ -85,64 +146,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Environment variables
-CHATBOT_URL = os.getenv("CHATBOT_URL", "https://agriwatthub.com/chatbot-api.php")
-MAX_AUDIO_SIZE = int(os.getenv("MAX_AUDIO_SIZE", 5 * 1024 * 1024))  # 5MB limit
-PORT = int(os.getenv("PORT", 8000))
-
-# Initialize Google Cloud clients
-speech_client = None
-tts_client = None
-
-def initialize_google_clients():
-    global speech_client, tts_client
-    try:
-        creds_base64 = os.getenv("GOOGLE_CREDENTIALS_BASE64")
-        if creds_base64:
-            import base64
-            from google.oauth2 import service_account
-            creds_json = base64.b64decode(creds_base64).decode('utf-8')
-            credentials = service_account.Credentials.from_service_account_info(
-                json.loads(creds_json)
-            )
-            speech_client = speech.SpeechClient(credentials=credentials)
-            tts_client = texttospeech.TextToSpeechClient(credentials=credentials)
-            logger.info("✅ Google Cloud clients initialized from environment variable")
-            return
-    except Exception as e:
-        logger.error(f"❌ Failed to initialize Google Cloud clients: {e}")
-
-# --- Startup and Shutdown Events ---
-@app.on_event("startup")
-async def startup_event():
-    global http_session
-    logger.info("🚆 Starting AgriWatt Voice Bot on Railway")
-
-    # Initialize Google clients
-    initialize_google_clients()
-
-    # Create httpx session with connection pooling limits for Railway
-    if http_session is None:
-        http_session = httpx.AsyncClient(
-            timeout=30,
-            limits=httpx.Limits(max_connections=5, max_keepalive_connections=2)
-        )
-        logger.info("✅ Global httpx session created with connection limits")
-
-    # Skip PHP chatbot test on startup to avoid thread creation
-    logger.info("⏭️  Skipping startup PHP chatbot test to conserve resources")
-    logger.info(f"✅ AgriWatt Voice Bot ready on port {PORT}")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    global http_session
-    if http_session:
-        await http_session.aclose()
-        logger.info("🛑 httpx session closed")
-
-# --- PHP Chatbot Call ---
 async def call_php_chatbot(message: str, session_id: Optional[str] = None) -> dict:
+    """Call PHP chatbot API"""
     global http_session
+    
     try:
         payload = {"message": message}
         if session_id:
@@ -157,9 +164,8 @@ async def call_php_chatbot(message: str, session_id: Optional[str] = None) -> di
         if not http_session:
             http_session = httpx.AsyncClient(
                 timeout=30,
-                limits=httpx.Limits(max_connections=5, max_keepalive_connections=2)
+                limits=httpx.Limits(max_connections=3, max_keepalive_connections=1)
             )
-            logger.warning("⚠️ Created new httpx session")
 
         response = await http_session.post(CHATBOT_URL, json=payload, headers=headers)
 
@@ -181,15 +187,14 @@ async def call_php_chatbot(message: str, session_id: Optional[str] = None) -> di
         return {"success": False, "reply": "Samahani, kuna hitilafu isiyotarajiwa."}
 
 def check_memory_usage():
-    """Simple memory check"""
+    """Check memory usage"""
     try:
-        memory = psutil.virtual_memory()
-        return memory.percent
-    except Exception:
+        return psutil.virtual_memory().percent
+    except:
         return 0
 
 def reduce_audio_quality(audio_content: bytes) -> bytes:
-    """Reduce audio quality to save memory"""
+    """Reduce audio quality for memory optimization"""
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_in:
             temp_in.write(audio_content)
@@ -208,41 +213,22 @@ def reduce_audio_quality(audio_content: bytes) -> bytes:
             if os.path.exists(path):
                 os.unlink(path)
                 
-        logger.info("Audio quality reduced for Railway optimization")
         return reduced_audio
-        
     except Exception as e:
-        logger.warning(f"Audio quality reduction failed: {e}")
+        logger.warning(f"Audio reduction failed: {e}")
         return audio_content
 
 def enhanced_language_detection(text: str) -> str:
-    """Enhanced multilingual detection"""
+    """Enhanced language detection"""
     try:
-        detected_lang = detect(text.lower())
-        
-        agricultural_terms = {
-            'en': ['farm', 'crop', 'irrigation', 'harvest', 'soil', 'weather'],
-            'sw': ['shamba', 'mazao', 'umwagiliaji', 'mvua', 'udongo'],
-            'fr': ['ferme', 'culture', 'irrigation', 'récolte', 'sol'],
-            'es': ['granja', 'cultivo', 'riego', 'cosecha', 'suelo']
-        }
-        
-        text_lower = text.lower()
-        for lang, terms in agricultural_terms.items():
-            for term in terms:
-                if term in text_lower and lang == detected_lang:
-                    return detected_lang
-        
-        return detected_lang
-        
+        return detect(text.lower())
     except:
         return 'en'
 
 def convert_audio_format(audio_content: bytes, target_format: str = "wav") -> bytes:
-    """Convert audio to compatible format"""
+    """Convert audio format"""
     try:
-        memory_usage = check_memory_usage()
-        if memory_usage > 70:
+        if check_memory_usage() > 70:
             audio_content = reduce_audio_quality(audio_content)
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=".audio") as temp_in:
@@ -265,13 +251,12 @@ def convert_audio_format(audio_content: bytes, target_format: str = "wav") -> by
                 os.unlink(path)
                 
         return converted_audio
-        
     except Exception as e:
         logger.error(f"Audio conversion error: {e}")
         return audio_content
 
 def get_speech_context():
-    """Provide domain-specific phrases"""
+    """Domain-specific speech context"""
     return speech.SpeechContext(phrases=[
         "agriwatt", "agriculture", "farming", "kenya", "crops", "irrigation", 
         "solar", "maize", "coffee", "tea", "smart farming"
@@ -282,34 +267,29 @@ def correct_domain_terms(transcript: str) -> str:
     corrections = {
         "agree what": "agriwatt",
         "agree watt": "agriwatt",
-        "agriculture what": "agriwatt",
-        "agri what": "agriwatt"
+        "agriculture what": "agriwatt"
     }
     
-    transcript_lower = transcript.lower()
     for wrong, correct in corrections.items():
-        if wrong in transcript_lower:
+        if wrong in transcript.lower():
             transcript = transcript.replace(wrong, correct)
     
     return transcript
 
 def get_voice_config(language_code: str) -> tuple:
-    """Get appropriate voice configuration"""
+    """Get voice configuration"""
     voice_map = {
         'en': ('en-US-Wavenet-F', texttospeech.SsmlVoiceGender.FEMALE, 'en-US'),
         'sw': ('en-US-Wavenet-D', texttospeech.SsmlVoiceGender.MALE, 'en-US'),
         'fr': ('fr-FR-Wavenet-A', texttospeech.SsmlVoiceGender.FEMALE, 'fr-FR'),
         'es': ('es-ES-Wavenet-B', texttospeech.SsmlVoiceGender.MALE, 'es-ES'),
     }
-    
-    voice_config = voice_map.get(language_code, voice_map['en'])
-    return voice_config[0], voice_config[1], voice_config[2]
+    return voice_map.get(language_code, voice_map['en'])
 
 def enhance_audio_quality(audio_content: bytes) -> bytes:
     """Enhance audio quality"""
     try:
-        memory_usage = check_memory_usage()
-        if memory_usage > 75:
+        if check_memory_usage() > 75:
             return audio_content
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_in:
@@ -320,10 +300,8 @@ def enhance_audio_quality(audio_content: bytes) -> bytes:
         audio = audio.high_pass_filter(80).normalize()
         
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_out:
-            audio.export(temp_out.name, format="wav", parameters=[
-                "-ac", "1", "-ar", "16000", "-acodec", "pcm_s16le"
-            ])
-            
+            audio.export(temp_out.name, format="wav", 
+                        parameters=["-ac", "1", "-ar", "16000", "-acodec", "pcm_s16le"])
             with open(temp_out.name, "rb") as f:
                 enhanced_audio = f.read()
         
@@ -332,16 +310,19 @@ def enhance_audio_quality(audio_content: bytes) -> bytes:
                 os.unlink(path)
                 
         return enhanced_audio
-        
-    except Exception as e:
+    except:
         return audio_content
 
 async def process_audio_to_text(audio_content: bytes, content_type: str = "audio/webm") -> str:
-    """Convert audio to text - NO ThreadPoolExecutor"""
+    """Convert audio to text"""
+    # Initialize Google clients on first use (lazy initialization)
+    if speech_client is None:
+        initialize_google_clients()
+    
+    if speech_client is None:
+        raise HTTPException(status_code=503, detail="Speech service unavailable")
+    
     try:
-        if speech_client is None:
-            raise HTTPException(status_code=503, detail="Speech service unavailable")
-        
         memory_usage = check_memory_usage()
         if memory_usage > 80:
             audio_content = reduce_audio_quality(audio_content)
@@ -361,7 +342,6 @@ async def process_audio_to_text(audio_content: bytes, content_type: str = "audio
         
         if content_type not in ['audio/webm', 'audio/wav']:
             audio_content = convert_audio_format(audio_content, "wav")
-            content_type = 'audio/wav'
             file_ext = 'wav'
         
         encoding_map = {
@@ -373,7 +353,6 @@ async def process_audio_to_text(audio_content: bytes, content_type: str = "audio
         encoding = encoding_map.get(file_ext, speech.RecognitionConfig.AudioEncoding.WEBM_OPUS)
         
         audio = speech.RecognitionAudio(content=audio_content)
-        
         config = speech.RecognitionConfig(
             encoding=encoding,
             sample_rate_hertz=16000,
@@ -386,7 +365,7 @@ async def process_audio_to_text(audio_content: bytes, content_type: str = "audio
             speech_contexts=[get_speech_context()] 
         )
         
-        # CRITICAL: Use asyncio.to_thread instead of ThreadPoolExecutor
+        # Use asyncio.to_thread for async gRPC call
         response = await asyncio.to_thread(speech_client.recognize, config=config, audio=audio)
         
         if not response.results:
@@ -399,7 +378,7 @@ async def process_audio_to_text(audio_content: bytes, content_type: str = "audio
         logger.info(f"STT: '{transcript}' (Confidence: {confidence:.2f})")
         
         if confidence < 0.5:
-            raise HTTPException(status_code=400, detail="Low confidence speech recognition")
+            raise HTTPException(status_code=400, detail="Low confidence")
         
         return transcript.strip()
         
@@ -411,10 +390,14 @@ async def process_audio_to_text(audio_content: bytes, content_type: str = "audio
 
 def text_to_speech(text: str, language_code: str) -> Optional[str]:
     """Convert text to speech"""
+    # Initialize Google clients on first use
+    if tts_client is None:
+        initialize_google_clients()
+    
+    if tts_client is None:
+        return None
+    
     try:
-        if tts_client is None:
-            return None
-            
         if not text or not text.strip():
             return None
             
@@ -439,11 +422,10 @@ def text_to_speech(text: str, language_code: str) -> Optional[str]:
             audio_config=audio_config
         )
 
-        audio_base64 = base64.b64encode(response.audio_content).decode('utf-8')
-        return audio_base64
+        return base64.b64encode(response.audio_content).decode('utf-8')
         
     except Exception as e:
-        logger.error(f"TTS failed for {language_code}: {e}")
+        logger.error(f"TTS failed: {e}")
         return None
 
 @app.post("/api/voice")
@@ -457,9 +439,6 @@ async def process_voice(
         if memory_usage > 85:
             raise HTTPException(status_code=503, detail="System overloaded")
         
-        if speech_client is None or tts_client is None:
-            raise HTTPException(status_code=503, detail="Service unavailable")
-        
         if not audio.content_type or not audio.content_type.startswith('audio/'):
             raise HTTPException(status_code=400, detail="Invalid audio file")
         
@@ -472,10 +451,7 @@ async def process_voice(
             raise HTTPException(status_code=400, detail="Audio too short")
 
         # Speech to Text
-        transcript = await process_audio_to_text(audio_content)
-
-        # Detect language
-        detected_lang = enhanced_language_detection(transcript)
+        transcript = await process_audio_to_text(audio_content, audio.content_type)
 
         # Call PHP Chatbot
         chatbot_response = await call_php_chatbot(transcript, session_id)
@@ -538,15 +514,14 @@ async def chatbot_endpoint(request_data: ChatbotRequest):
 
 @app.get("/health")
 async def health_check():
-    """OPTIMIZED health check - cached PHP chatbot status"""
+    """Optimized health check with caching"""
     global _health_cache
     
     try:
         memory = psutil.virtual_memory()
-        disk = psutil.disk_usage('/')
-        google_status = "connected" if speech_client and tts_client else "disconnected"
+        google_status = "connected" if speech_client and tts_client else "lazy_init"
         
-        # Only check PHP chatbot every 60 seconds to avoid thread creation
+        # Cache PHP chatbot checks
         now = datetime.now()
         if (_health_cache["last_check"] is None or 
             (now - _health_cache["last_check"]).total_seconds() > HEALTH_CACHE_SECONDS):
@@ -561,13 +536,9 @@ async def health_check():
                 _health_cache["php_error"] = str(e)
                 _health_cache["last_check"] = now
         
-        # Determine overall status
-        if google_status == "connected" and memory.percent < 90:
-            status = "healthy" if _health_cache["php_status"] == "connected" else "degraded"
-        else:
-            status = "unhealthy"
+        status = "healthy" if memory.percent < 90 else "unhealthy"
         
-        health_data = {
+        return {
             "status": status,
             "service": "AgriWatt Voice Bot",
             "memory_usage": f"{memory.percent}%",
@@ -575,11 +546,6 @@ async def health_check():
             "php_chatbot": _health_cache["php_status"],
             "timestamp": datetime.now().isoformat()
         }
-        
-        if _health_cache["php_error"]:
-            health_data["php_note"] = "Cached status"
-            
-        return health_data
         
     except Exception as e:
         return {
@@ -591,15 +557,11 @@ async def health_check():
 @app.get("/")
 async def root():
     """Root endpoint"""
-    google_status = "connected" if speech_client and tts_client else "disconnected"
-    memory_usage = check_memory_usage()
-    
     return {
         "message": "AgriWatt Voice Bot API",
-        "version": "1.0.0",
-        "status": google_status,
+        "version": "1.0.1",
         "platform": "Railway",
-        "memory_usage": f"{memory_usage}%",
+        "memory_usage": f"{check_memory_usage()}%",
         "endpoints": {
             "voice": "/api/voice (POST)",
             "chatbot": "/api/chatbot (POST)", 
@@ -609,7 +571,6 @@ async def root():
     }
 
 if __name__ == "__main__":
-    initialize_google_clients()
     print(f"🚀 Starting AgriWatt Voice Server on port {PORT}...")
     uvicorn.run(
         app,
