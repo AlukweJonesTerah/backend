@@ -3,7 +3,7 @@ builder = "nixpacks"
 
 [deploy]
 numReplicas = 1
-# FIX: changed ${PORT} -> $PORT
+# Run via Python so PORT is handled inside main.py
 startCommand = "python main.py"
 
 [variables]
