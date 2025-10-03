@@ -775,9 +775,16 @@ async def metrics():
         return {"error": str(e)}
 
 if __name__ == "__main__":
-    # Initialize for local development
     initialize_google_clients()
     
+    # Safely parse PORT
+    port_env = os.getenv("PORT", "8000")
+    try:
+        PORT = int(port_env)
+    except ValueError:
+        print(f"⚠️ Invalid PORT value '{port_env}', falling back to 8000")
+        PORT = 8000
+
     if is_port_in_use(PORT):
         print(f"⚠️  Port {PORT} is already in use!")
         print("💡 Try these solutions:")
