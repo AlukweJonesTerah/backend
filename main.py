@@ -274,7 +274,8 @@ async def process_audio_to_text(audio_content: bytes, content_type: str = "audio
         
         creds_json = base64.b64decode(creds_base64).decode('utf-8')
         credentials = service_account.Credentials.from_service_account_info(
-            json.loads(creds_json)
+            json.loads(creds_json),
+            scopes=['https://www.googleapis.com/auth/cloud-platform']
         )
         
         # Get access token
@@ -370,7 +371,8 @@ async def text_to_speech(text: str, language_code: str) -> Optional[str]:
         
         creds_json = base64.b64decode(creds_base64).decode('utf-8')
         credentials = service_account.Credentials.from_service_account_info(
-            json.loads(creds_json)
+            json.loads(creds_json),
+            scopes=['https://www.googleapis.com/auth/cloud-platform']
         )
         
         # Get access token
