@@ -9,18 +9,17 @@ from typing import Optional
 from pydub import AudioSegment
 from datetime import datetime
 import json
-import resource
-import psutil  
+import psutil
+import aiohttp
 
-def check_memory_usage():
-    """Simple memory check without psutil"""
-    try:
-        import psutil
-        memory = psutil.virtual_memory()
-        return memory.percent
-    except ImportError:
-        # Fallback if psutil not available
-        return 0
+# Safe import for Linux-only resource module
+try:
+    import resource
+except ImportError:
+    resource = None
+
+# --- Global aiohttp session ---
+session: aiohttp.ClientSession = None
 
 # Set seed for consistent language detection
 DetectorFactory.seed = 0
@@ -38,33 +37,18 @@ logger = logging.getLogger(__name__)
 # Railway-specific optimizations
 if os.getenv("RAILWAY_ENVIRONMENT"):
     logger.info("🚆 Running on Railway - applying optimizations")
-    
-    # Reduce memory usage for Railway's free tier
+
     os.environ["GRPC_ENABLE_FORK_SUPPORT"] = "False"
     os.environ["GRPC_POLL_STRATEGY"] = "poll"
-    
-    # Set memory limits
-    try:
-        # 450MB limit to stay safe within 512MB
-        memory_limit = 450 * 1024 * 1024
-        resource.setrlimit(resource.RLIMIT_AS, (memory_limit, memory_limit))
-        logger.info("Memory limits set for Railway free tier")
-    except:
-        logger.warning("Could not set memory limits")
 
-def optimize_thread_pool():
-    """Optimize thread pool for Railway free tier"""
-    import concurrent.futures
-    return concurrent.futures.ThreadPoolExecutor(max_workers=2)
-
-# Initialize optimized executor
-executor = optimize_thread_pool()
-
-def is_port_in_use(port: int) -> bool:
-    """Check if port is in use (for local development)"""
-    import socket
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        return s.connect_ex(('localhost', port)) == 0
+    if resource:
+        try:
+            # 450MB limit to stay safe within 512MB
+            memory_limit = 450 * 1024 * 1024
+            resource.setrlimit(resource.RLIMIT_AS, (memory_limit, memory_limit))
+            logger.info("Memory limits set for Railway free tier")
+        except Exception as e:
+            logger.warning(f"Could not set memory limits: {e}")
 
 # Pydantic models
 class ChatbotRequest(BaseModel):
@@ -126,6 +110,114 @@ def initialize_google_clients():
     except Exception as e:
         logger.error(f"❌ Failed to initialize Google Cloud clients: {e}")
 
+# Initialize on startup
+@app.on_event("startup")
+async def startup_event():
+    """Startup optimization for Railway"""
+    global session
+    logger.info("🚆 Starting AgriWatt Voice Bot on Railway")
+
+    # Initialize Google clients
+    initialize_google_clients()
+
+    # Create one aiohttp session for all PHP chatbot calls
+    if session is None:
+        timeout = aiohttp.ClientTimeout(total=30)
+        session = aiohttp.ClientSession(timeout=timeout)
+        logger.info("✅ Global aiohttp session created")
+
+    # Test PHP chatbot connection
+    try:
+        test_response = await call_php_chatbot("test", "startup-test")
+        if test_response.get("success"):
+            logger.info("✅ PHP chatbot connection successful")
+        else:
+            logger.warning(f"⚠️ PHP chatbot test failed: {test_response.get('reply', 'Unknown error')}")
+    except Exception as e:
+        logger.error(f"❌ PHP chatbot connection test failed: {e}")
+
+    logger.info(f"✅ AgriWatt Voice Bot ready on port {PORT}")
+    logger.info(f"✅ Memory usage: {check_memory_usage()}%")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup on shutdown"""
+    global session
+    if session:
+        await session.close()
+        logger.info("🛑 aiohttp session closed")
+
+async def call_php_chatbot(message: str, session_id: Optional[str] = None) -> dict:
+    global session
+    try:
+        payload = {"message": message}
+        if session_id:
+            payload["session_id"] = session_id
+
+        headers = {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            'User-Agent': 'AgriWatt-Voice-Bot/1.0'
+        }
+
+        if not session:
+            timeout = aiohttp.ClientTimeout(total=30)
+            session = aiohttp.ClientSession(timeout=timeout)
+            logger.warning("⚠️ Created new aiohttp session (startup might have failed)")
+
+        logger.info(f"Calling PHP chatbot: {CHATBOT_URL}")
+
+        async with session.post(CHATBOT_URL, json=payload, headers=headers) as response:
+            logger.info(f"PHP chatbot response status: {response.status}")
+
+            if response.status != 200:
+                return {"success": False, "reply": "Samahani, mfumo wa mazungumzo unakabiliwa na shida."}
+
+            response_data = await response.json()
+            if not isinstance(response_data, dict):
+                return {"success": False, "reply": "Samahani, jibu lisilotarajiwa."}
+
+            response_data.setdefault("success", True)
+            response_data.setdefault("reply", "Samahani, hakuna jibu.")
+            return response_data
+
+    except asyncio.TimeoutError:
+        return {"success": False, "reply": "Samahani, mfumo umechelewa."}
+    except Exception as e:
+        logger.error(f"Unexpected error calling PHP chatbot: {e}")
+        return {"success": False, "reply": "Samahani, kuna hitilafu isiyotarajiwa."}
+
+                
+    except asyncio.TimeoutError:
+        logger.error("PHP chatbot request timed out")
+        return {"success": False, "reply": "Samahani, mfumo umechelewa."}
+    except Exception as e:
+        logger.error(f"Unexpected error calling PHP chatbot: {e}")
+        return {"success": False, "reply": "Samahani, kuna hitilafu isiyotarajiwa."}
+
+def check_memory_usage():
+    """Simple memory check without psutil"""
+    try:
+        memory = psutil.virtual_memory()
+        return memory.percent
+    except ImportError:
+        # Fallback if psutil not available
+        return 0
+
+def optimize_thread_pool():
+    """Optimize thread pool for Railway free tier"""
+    import concurrent.futures
+    return concurrent.futures.ThreadPoolExecutor(max_workers=2)
+
+# Initialize optimized executor
+executor = optimize_thread_pool()
+
+def is_port_in_use(port: int) -> bool:
+    """Check if port is in use (for local development)"""
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        return s.connect_ex(('localhost', port)) == 0
+
 def check_memory_usage():
     """Check current memory usage"""
     try:
@@ -166,28 +258,6 @@ def reduce_audio_quality(audio_content: bytes) -> bytes:
     except Exception as e:
         logger.warning(f"Audio quality reduction failed: {e}")
         return audio_content
-
-# Initialize on startup
-@app.on_event("startup")
-async def startup_event():
-    """Startup optimization for Railway"""
-    logger.info("🚆 Starting AgriWatt Voice Bot on Railway")
-    
-    # Initialize Google clients
-    initialize_google_clients()
-    
-    # Test PHP chatbot connection
-    try:
-        test_response = await call_php_chatbot("test", "startup-test")
-        if test_response.get("success"):
-            logger.info("✅ PHP chatbot connection successful")
-        else:
-            logger.warning(f"⚠️ PHP chatbot test failed: {test_response.get('reply', 'Unknown error')}")
-    except Exception as e:
-        logger.error(f"❌ PHP chatbot connection test failed: {e}")
-    
-    logger.info(f"✅ AgriWatt Voice Bot ready on port {PORT}")
-    logger.info(f"✅ Memory usage: {check_memory_usage()}%")
 
 def enhanced_language_detection(text: str) -> str:
     """Enhanced multilingual detection with agricultural focus"""
@@ -462,89 +532,7 @@ def extract_audio_metadata(audio_path: str) -> dict:
     except Exception as e:
         logger.error(f"Failed to extract audio metadata: {e}")
         return {"sample_rate_hertz": 48000, "audio_channel_count": 2}
-    
-async def call_php_chatbot(message: str, session_id: Optional[str] = None) -> dict:
-    """Call the PHP chatbot backend and return the complete response - FIXED VERSION"""
-    try:
-        payload = {"message": message}
-        if session_id:
-            payload["session_id"] = session_id
         
-        headers = {
-            'Content-Type': 'application/json',
-            'Accept': 'application/json',
-            'User-Agent': 'AgriWatt-Voice-Bot/1.0'
-        }
-
-        logger.info(f"Calling PHP chatbot: {CHATBOT_URL}")
-        logger.info(f"Payload: {payload}")
-
-        response = await asyncio.wait_for(
-            asyncio.get_event_loop().run_in_executor(
-                executor, 
-                lambda: requests.post(CHATBOT_URL, json=payload, headers=headers, timeout=30)
-            ),
-            timeout=35
-        )
-
-        logger.info(f"PHP chatbot response status: {response.status_code}")
-        
-        # Check if response is successful
-        if response.status_code != 200:
-            logger.error(f"PHP chatbot returned non-200 status: {response.status_code}")
-            return {
-                "success": False, 
-                "reply": f"Samahani, mfumo wa mazungumzo unakabiliwa na shida. Tafadhali jaribu tena baadaye. (Status: {response.status_code})"
-            }
-        
-        # Try to parse JSON response
-        try:
-            response_data = response.json()
-            
-            # Ensure the response has the expected structure
-            if not isinstance(response_data, dict):
-                logger.error(f"PHP chatbot returned non-dict response: {type(response_data)}")
-                return {
-                    "success": False,
-                    "reply": "Samahani, jibu lisilotarajiwa limepokelewa kutoka kwa mfumo wa mazungumzo."
-                }
-            
-            # Ensure success field exists
-            if 'success' not in response_data:
-                response_data['success'] = True  # Assume success if not specified
-                
-            # Ensure reply field exists
-            if 'reply' not in response_data:
-                response_data['reply'] = "Samahani, hakuna jibu lililopokelewa."
-                
-            return response_data
-            
-        except ValueError as e:
-            logger.error(f"Failed to parse PHP chatbot JSON response: {e}")
-            logger.error(f"Response content: {response.text[:200]}...")
-            return {
-                "success": False,
-                "reply": "Samahani, jibu lisilotarajiwa limepokelewa kutoka kwa mfumo wa mazungumzo."
-            }
-        
-    except asyncio.TimeoutError:
-        logger.error("PHP chatbot request timed out")
-        return {
-            "success": False, 
-            "reply": "Samahani, mfumo umechelewa kukupatia jibu. Tafadhali jaribu tena baadaye."
-        }
-    except requests.RequestException as e:
-        logger.error(f"PHP chatbot request failed: {e}")
-        return {
-            "success": False, 
-            "reply": f"Samahani, kuna tatizo la kimtandao. Tafadhali jaribu tena. (Error: {str(e)})"
-        }
-    except Exception as e:
-        logger.error(f"Unexpected error calling PHP chatbot: {e}")
-        return {
-            "success": False, 
-            "reply": "Samahani, kuna hitilafu isiyotarajiwa. Tafadhali jaribu tena."
-        }
 
 def text_to_speech(text: str, language_code: str) -> Optional[str]:
     """Convert text to speech with multilingual support"""
@@ -832,6 +820,7 @@ async def metrics():
         }
     except Exception as e:
         return {"error": str(e)}
+
 
 if __name__ == "__main__":
     initialize_google_clients()
